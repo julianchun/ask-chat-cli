@@ -1,0 +1,24 @@
+{
+  "name": "ask-chat-cli",
+  "version": "0.1.0",
+  "description": "Personal Windows-first ask CLI for driving ChatGPT or Gemini in a dedicated Chrome profile.",
+  "private": true,
+  "type": "commonjs",
+  "bin": {
+    "ask": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "playwright-core": "^1.55.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}
