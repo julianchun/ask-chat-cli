@@ -101,11 +101,11 @@ Run `ask --help` or `ask <command> --help` for the generated reference.
 Interactive runs show the provider, elapsed time, and conversation URL before the response:
 
 ```console
-$ ask --continue "hi"
+$ ask --continue "Summarize that explanation in one sentence"
 ✓ ChatGPT · continued · 2.4s
 ↗ https://chatgpt.com/c/example
 
-Hi! 👋
+The sky appears blue because Earth's atmosphere scatters shorter blue wavelengths of sunlight more strongly than longer red wavelengths.
 ```
 
 Responses go to stdout while progress and session details go to stderr, so pipelines stay clean:
