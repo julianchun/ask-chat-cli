@@ -45,46 +45,67 @@ export ASK_CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Ch
 export ASK_CHROME_PATH="/usr/bin/google-chrome"
 ```
 
-Open the dedicated browser profile and sign in:
+Run `ask login` to open Chrome with a dedicated `ask` profile:
 
 ```console
 ask login
+```
+
+Sign in to ChatGPT in the browser window. The dedicated Chrome profile preserves that login and is reused by later commands, so you normally only need to sign in once.
+
+After signing in:
+
+```console
 ask "Explain why the sky is blue"
 ```
 
-For Gemini:
+For Gemini, open its login page and sign in the same way:
 
 ```console
 ask --provider gemini login
 ask --provider gemini "Explain why the sky is blue"
 ```
 
-## Common usage
+## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `ask "prompt"` | Start a new conversation and return the response |
-| `ask --continue "prompt"` | Continue the previous conversation |
-| `ask -a image.png "prompt"` | Attach a file; repeat `-a` for more files |
-| `git diff \| ask "Review this diff"` | Send piped input |
-| `ask "prompt" -o answer.md` | Save the response to a file |
-| `ask --provider gemini "prompt"` | Use Gemini instead of ChatGPT |
-| `ask open "prompt"` | Fill a prompt in the visible browser |
-| `ask get` | Print the latest response from the current page |
-| `ask screenshot` | Capture the current provider page |
-| `ask status --verbose` | Inspect browser and login status |
+| `ask [prompt...]` | Send a prompt and wait for the response; reads stdin when omitted |
+| `ask login` | Open the dedicated Chrome profile for sign-in |
+| `ask open [url\|prompt...]` | Open a conversation or fill a prompt in the visible browser |
+| `ask get` | Print the latest response from the current provider page |
+| `ask dump` | Print or save the current provider page HTML |
+| `ask screenshot` | Save a screenshot of the current provider page |
+| `ask status` | Show provider, browser, login, and readiness status |
 
-Run `ask --help` for all commands and options.
+### Options
+
+| Option | Applies to | Purpose |
+| --- | --- | --- |
+| `--provider <chatgpt\|gemini>` | All commands | Select the web-chat provider |
+| `-a, --attach <file>` | Prompt, `open` | Attach a file; repeat for multiple files |
+| `-o, --output <file>` | Prompt, `get`, `dump`, `screenshot` | Write output to a file |
+| `--new` | Prompt, `open` | Start a new conversation; this is the default |
+| `--continue` | Prompt, `open` | Continue the previous conversation |
+| `--send` | `open` | Submit the filled prompt and exit without waiting |
+| `--headless` | Prompt, `get`, `dump`, `screenshot` | Run the managed Chrome session headlessly |
+| `--timeout <ms>` | All commands | Set the operation timeout |
+| `-v, --verbose` | All commands | Print browser and session details |
+| `-V, --version` | Top level | Print the CLI version |
+| `-h, --help` | All commands | Show command help |
+
+Run `ask --help` or `ask <command> --help` for the generated reference.
 
 ## Output
 
 Interactive runs show the provider, elapsed time, and conversation URL before the response:
 
-```text
+```console
+$ ask --continue "Summarize that explanation in one sentence"
 ✓ ChatGPT · continued · 2.4s
 ↗ https://chatgpt.com/c/example
 
-Hi! 👋
+The sky appears blue because Earth's atmosphere scatters shorter blue wavelengths of sunlight more strongly than longer red wavelengths.
 ```
 
 Responses go to stdout while progress and session details go to stderr, so pipelines stay clean:
