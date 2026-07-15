@@ -93,7 +93,8 @@ Run `ask --help` or `ask <command> --help` for the generated reference.
 
 Interactive runs show the provider, elapsed time, and conversation URL before the response:
 
-```text
+```console
+$ ask --continue "hi"
 ✓ ChatGPT · continued · 2.4s
 ↗ https://chatgpt.com/c/example
 
