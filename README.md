@@ -45,14 +45,21 @@ export ASK_CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Ch
 export ASK_CHROME_PATH="/usr/bin/google-chrome"
 ```
 
-Open the dedicated browser profile and sign in:
+Run `ask login` to open Chrome with a dedicated `ask` profile:
 
 ```console
 ask login
+```
+
+Sign in to ChatGPT in the browser window. The dedicated Chrome profile preserves that login and is reused by later commands, so you normally only need to sign in once.
+
+After signing in:
+
+```console
 ask "Explain why the sky is blue"
 ```
 
-For Gemini:
+For Gemini, open its login page and sign in the same way:
 
 ```console
 ask --provider gemini login
