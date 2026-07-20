@@ -77,6 +77,8 @@ ask --provider gemini "Explain why the sky is blue"
 | `ask dump` | Print or save the current provider page HTML |
 | `ask screenshot` | Save a screenshot of the current provider page |
 | `ask status` | Show provider, browser, login, and readiness status |
+| `ask conversations list` | List locally named conversations |
+| `ask conversations forget <name>` | Forget a local name without deleting the provider chat |
 
 ### Options
 
@@ -87,7 +89,8 @@ ask --provider gemini "Explain why the sky is blue"
 | `-o, --output <file>` | Prompt, `get`, `dump`, `screenshot` | Write output to a file |
 | `--new` | Prompt, `open` | Start a new conversation; this is the default |
 | `--continue` | Prompt, `open` | Continue the previous conversation |
-| `--send` | `open` | Submit the filled prompt and exit without waiting |
+| `--conversation <name>` | Prompt, `open` | Resume a named conversation, or create it if missing |
+| `--send` | `open` | Submit the filled prompt and wait for completion |
 | `--headless` | Prompt, `get`, `dump`, `screenshot` | Run the managed Chrome session headlessly |
 | `--timeout <ms>` | All commands | Set the operation timeout |
 | `-v, --verbose` | All commands | Print browser and session details |
@@ -95,6 +98,50 @@ ask --provider gemini "Explain why the sky is blue"
 | `-h, --help` | All commands | Show command help |
 
 Run `ask --help` or `ask <command> --help` for the generated reference.
+
+## Named conversations
+
+Use names for recurring workflows that should keep separate context:
+
+```console
+git diff | ask --conversation code-review "Review these changes"
+ask --conversation release-notes "Draft notes for the next release"
+ask --provider gemini --conversation research "Continue the comparison"
+```
+
+The first use creates a provider conversation and saves its URL locally. Later uses resume that conversation. Names are lowercase, provider-specific, and may contain letters, numbers, dots, underscores, or hyphens.
+
+Start over while keeping the same name with `--new`:
+
+```console
+ask --conversation release-notes --new "Plan the next release"
+```
+
+Inspect or forget local mappings:
+
+```console
+ask conversations list
+ask conversations list --provider chatgpt --json
+ask conversations forget release-notes --provider chatgpt
+```
+
+Forgetting a name does not delete the conversation from ChatGPT or Gemini. `--continue` still resumes the most recently used unnamed or named conversation for backward compatibility.
+
+When creating a name through `ask open`, include `--send`; the provider must create a conversation URL before `ask` can save the name. Existing named conversations can be opened without sending.
+
+## Parallel execution
+
+Prompt commands may share one Chrome profile and remote-debugging port while running in parallel:
+
+```console
+ask --conversation research-a "Compare option A" >a.txt &
+ask --conversation research-b "Compare option B" >b.txt &
+wait
+```
+
+`ask` allows four active prompt executions and four waiting executions. A ninth request fails immediately. Waiting requests use a global FIFO queue and time out after five minutes; this queue wait is separate from `--timeout`, which starts after execution begins.
+
+Each execution uses a fresh temporary tab and closes it afterward. Requests using the same provider and conversation name run sequentially. `--continue` waits for all active work for that provider so the meaning of “previous conversation” remains deterministic. Login and Chrome visibility-mode changes are rejected while prompt executions are active.
 
 ## Output
 
@@ -128,7 +175,7 @@ Command-line options override environment defaults.
 
 ## Sessions and privacy
 
-`ask` keeps login state in its own Chrome profile under `~/.ask/chrome-profile` on macOS/Linux or `%USERPROFILE%\.ask\chrome-profile` on Windows. It never copies or reuses your normal Chrome profile.
+`ask` keeps login state in its own Chrome profile under `~/.ask/chrome-profile` on macOS/Linux or `%USERPROFILE%\.ask\chrome-profile` on Windows. Named conversation URLs are stored in `~/.ask/conversations.json` or its Windows equivalent. It never copies or reuses your normal Chrome profile.
 
 Prompts and attachments are sent to the selected provider. Treat the ask home directory as sensitive and do not commit it.
 
@@ -144,4 +191,7 @@ Prompts and attachments are sent to the selected provider. Treat the ask home di
 npm test
 npm run typecheck
 npm run build
+npm run test:browser
 ```
+
+`npm run test:browser` requires `ASK_CHROME_PATH` and runs isolated pages in a real Chrome process over one debugging port. The opt-in `ASK_LIVE_TEST=1 npm run test:live:parallel` command sends six real ChatGPT prompts, creates provider conversations, and consumes account usage; it is intentionally excluded from the normal test suite.

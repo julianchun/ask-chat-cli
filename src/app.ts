@@ -7,7 +7,16 @@ import {
   type ChromeSessionRequest
 } from "./browser";
 import { getScreenshotsDir } from "./config";
-import { createConversationContinuity, type ConversationContinuity } from "./conversations";
+import {
+  createConversationContinuity,
+  type ConversationContinuity,
+  type NamedConversation
+} from "./conversations";
+import {
+  createExecutionQueue,
+  type ExecutionQueue,
+  type ExecutionQueueUpdate
+} from "./execution-queue";
 import { timestampForFile } from "./io";
 import { getProvider, resolveProviderName, type ProviderDefinition, type ProviderName } from "./providers";
 import type { SessionOwnership } from "./session";
@@ -24,6 +33,7 @@ export interface AppOptions {
   env?: NodeJS.ProcessEnv;
   chromeSession?: ChromeSessionController;
   conversationContinuity?: ConversationContinuity;
+  executionQueue?: ExecutionQueue;
 }
 
 export interface PromptRunOptions {
@@ -32,7 +42,9 @@ export interface PromptRunOptions {
   provider?: ProviderName;
   headless?: boolean;
   newSession?: boolean;
+  conversationName?: string;
   onContinuationUnavailable?: () => void;
+  onQueueUpdate?: (update: ExecutionQueueUpdate) => void;
   timeoutMs: number;
   verbose?: boolean;
 }
@@ -75,11 +87,13 @@ export class AskApp {
   private readonly env: NodeJS.ProcessEnv;
   private readonly chromeSession: ChromeSessionController;
   private readonly conversations: ConversationContinuity;
+  private readonly executionQueue: ExecutionQueue;
 
   constructor(options: AppOptions = {}) {
     this.env = options.env || process.env;
     this.chromeSession = options.chromeSession || createChromeSessionController(this.env);
     this.conversations = options.conversationContinuity || createConversationContinuity(this.env);
+    this.executionQueue = options.executionQueue || createExecutionQueue(this.env);
   }
 
   async login(options: SimpleBrowserOptions = {}): Promise<void> {
@@ -87,121 +101,239 @@ export class AskApp {
       throw new Error("`ask login` requires a visible browser. Use `ask login --provider <provider>` without --headless.");
     }
 
-    const provider = this.resolveProvider(options.provider);
-    const browser = await this.chromeSession.connect({
-      ...this.chromeOptions({ ...options, headless: false }),
-      requireManaged: true,
-      requireVisible: true,
-      url: provider.homeUrl
+    const lease = await this.executionQueue.acquireBrowserLease({
+      headless: false,
+      exclusive: true,
+      action: "log in or change the shared Chrome session"
     });
     try {
-      await openChatPage(browser, provider, provider.homeUrl);
+      const provider = this.resolveProvider(options.provider);
+      const browser = await this.chromeSession.connect({
+        ...this.chromeOptions({ ...options, headless: false }),
+        requireManaged: true,
+        requireVisible: true,
+        url: provider.homeUrl
+      });
+      try {
+        await openChatPage(browser, provider, provider.homeUrl);
+      } finally {
+        await browser.close();
+      }
     } finally {
-      await browser.close();
+      await lease.release();
     }
   }
 
   async open(options: OpenOptions): Promise<void> {
     const provider = this.resolveProvider(options.provider);
-    await this.assertHeadlessAllowedIfNeeded(provider, options);
-    const browser = await this.chromeSession.connect({
-      ...this.chromeOptions(options),
-      requireManaged: true,
-      requireVisible: !options.headless,
-      url: options.url
+    if (options.send) {
+      return this.openAndSend(provider, options);
+    }
+    const lease = await this.executionQueue.acquireBrowserLease({
+      headless: Boolean(options.headless),
+      action: "open the shared Chrome session in a different mode"
     });
     try {
-      const session = await this.conversations.resolve(browser, provider, {
-        requestedUrl: options.url,
-        newSession: options.newSession,
-        onContinuationUnavailable: options.onContinuationUnavailable
+      await this.assertHeadlessAllowedIfNeeded(provider, options);
+      const browser = await this.chromeSession.connect({
+        ...this.chromeOptions(options),
+        requireManaged: true,
+        requireVisible: !options.headless,
+        url: options.url
       });
-      const page = await openChatPage(browser, provider, session.url, { newSession: session.newSession });
-      if (options.send) {
-        if (!options.prompt) {
-          throw new Error("`ask open --send` requires a prompt.");
+      try {
+        const session = await this.conversations.resolve(browser, provider, {
+          requestedUrl: options.url,
+          newSession: options.newSession,
+          conversationName: options.conversationName,
+          onContinuationUnavailable: options.onContinuationUnavailable
+        });
+        if (session.conversationName && session.newSession && !options.send) {
+          throw new Error(
+            `Named conversation \"${session.conversationName}\" does not exist yet. ` +
+              "Use `ask open --send --conversation <name> <prompt>` so ask can save the new conversation URL."
+          );
         }
-        await this.assertSignedInBeforeSend(page, provider, options);
-      }
-      await provider.automation.attachFiles(page, options.attachments);
-      if (options.prompt) {
-        const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
-        if (options.send) {
-          await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
+        const page = await openChatPage(browser, provider, session.url, { newSession: true });
+        await provider.automation.attachFiles(page, options.attachments);
+        if (options.prompt) {
+          await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
         }
+        await this.conversations.remember(provider, page, session.conversationName);
+      } finally {
+        await browser.close();
       }
-      await this.conversations.remember(provider, page);
     } finally {
-      await browser.close();
+      await lease.release();
     }
   }
 
   async ask(options: PromptRunOptions): Promise<ResponseResult> {
     const provider = this.resolveProvider(options.provider);
-    await this.assertHeadlessAllowedIfNeeded(provider, options);
-    const browser = await this.chromeSession.connect({
-      ...this.chromeOptions(options),
-      requireManaged: true,
-      requireVisible: !options.headless,
-      url: provider.homeUrl
+    const lease = await this.executionQueue.acquire({
+      provider: provider.name,
+      conversationName: options.conversationName,
+      exclusiveProvider: options.newSession === false && !options.conversationName,
+      headless: options.headless,
+      onUpdate: options.onQueueUpdate
     });
     try {
-      const session = await this.conversations.resolve(browser, provider, {
-        requestedUrl: provider.homeUrl,
-        newSession: options.newSession,
-        onContinuationUnavailable: options.onContinuationUnavailable
+      await this.assertHeadlessAllowedIfNeeded(provider, options);
+      const browser = await this.chromeSession.connect({
+        ...this.chromeOptions(options),
+        requireManaged: true,
+        requireVisible: !options.headless,
+        url: provider.homeUrl
       });
-      const page = await openWorkerPage(browser, provider, session.url, session.preferredUrl);
-      await this.assertSignedInBeforeSend(page, provider, options);
-      await provider.automation.attachFiles(page, options.attachments);
-      const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
-      const baseline = await provider.automation.captureAssistantResponseBaseline(page);
-      await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
-      const result = await provider.automation.waitForAssistantCompletion(page, { timeoutMs: options.timeoutMs, baseline });
-      await this.conversations.remember(provider, page);
-      const conversationUrl = page.url();
-      return {
-        ...result,
-        ...(provider.matchesConversationUrl(conversationUrl) ? { conversationUrl } : {})
-      };
+      try {
+        const session = await this.conversations.resolve(browser, provider, {
+          requestedUrl: provider.homeUrl,
+          newSession: options.newSession,
+          conversationName: options.conversationName,
+          onContinuationUnavailable: options.onContinuationUnavailable
+        });
+        const page = await openWorkerPage(browser, provider, session.url);
+        try {
+          await this.assertSignedInBeforeSend(page, provider, options);
+          await provider.automation.attachFiles(page, options.attachments);
+          const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
+          const baseline = await provider.automation.captureAssistantResponseBaseline(page);
+          await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
+          const result = await provider.automation.waitForAssistantCompletion(page, { timeoutMs: options.timeoutMs, baseline });
+          if (result.timedOut) {
+            await provider.automation.stopAssistantGeneration(page);
+            return result;
+          }
+          await this.conversations.remember(provider, page, session.conversationName);
+          const conversationUrl = page.url();
+          return {
+            ...result,
+            ...(provider.matchesConversationUrl(conversationUrl) ? { conversationUrl } : {})
+          };
+        } finally {
+          await page.close().catch(() => undefined);
+        }
+      } finally {
+        await browser.close();
+      }
     } finally {
-      await browser.close();
+      await lease.release();
     }
   }
 
   async get(options: SimpleBrowserOptions = {}): Promise<string> {
     const provider = this.resolveProvider(options.provider);
-    const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+    const lease = await this.acquireBrowserReadLease(options, "read from the shared Chrome session");
     try {
-      const page = selectCurrentPage(browser, provider, await this.conversations.preferredUrl(provider));
-      return await provider.automation.extractLatestAssistantText(page);
+      const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+      try {
+        const page = selectCurrentPage(browser, provider, await this.conversations.preferredUrl(provider));
+        return await provider.automation.extractLatestAssistantText(page);
+      } finally {
+        await browser.close();
+      }
     } finally {
-      await browser.close();
+      await lease.release();
+    }
+  }
+
+  async listConversations(providerName?: ProviderName): Promise<NamedConversation[]> {
+    return this.conversations.list(providerName);
+  }
+
+  async forgetConversation(name: string, providerName?: ProviderName): Promise<boolean> {
+    const provider = this.resolveProvider(providerName);
+    const lease = await this.executionQueue.acquireConversationLease(provider.name, name);
+    try {
+      return await this.conversations.forget(provider.name, name);
+    } finally {
+      await lease.release();
+    }
+  }
+
+  private async openAndSend(provider: ProviderDefinition, options: OpenOptions): Promise<void> {
+    if (!options.prompt) {
+      throw new Error("`ask open --send` requires a prompt.");
+    }
+    const lease = await this.executionQueue.acquire({
+      provider: provider.name,
+      conversationName: options.conversationName,
+      exclusiveProvider: options.newSession === false && !options.conversationName,
+      headless: options.headless,
+      onUpdate: options.onQueueUpdate
+    });
+    try {
+      await this.assertHeadlessAllowedIfNeeded(provider, options);
+      const browser = await this.chromeSession.connect({
+        ...this.chromeOptions(options),
+        requireManaged: true,
+        requireVisible: true,
+        url: options.url
+      });
+      try {
+        const session = await this.conversations.resolve(browser, provider, {
+          requestedUrl: options.url,
+          newSession: options.newSession,
+          conversationName: options.conversationName,
+          onContinuationUnavailable: options.onContinuationUnavailable
+        });
+        const page = await openWorkerPage(browser, provider, session.url);
+        try {
+          await page.bringToFront();
+          await this.assertSignedInBeforeSend(page, provider, options);
+          await provider.automation.attachFiles(page, options.attachments);
+          const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
+          const baseline = await provider.automation.captureAssistantResponseBaseline(page);
+          await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
+          const result = await provider.automation.waitForAssistantCompletion(page, { timeoutMs: options.timeoutMs, baseline });
+          if (result.timedOut) {
+            await provider.automation.stopAssistantGeneration(page);
+            throw new Error(`Timed out waiting for ${provider.displayName}; the execution tab was closed.`);
+          }
+          await this.conversations.remember(provider, page, session.conversationName);
+        } finally {
+          await page.close().catch(() => undefined);
+        }
+      } finally {
+        await browser.close();
+      }
+    } finally {
+      await lease.release();
     }
   }
 
   async dump(options: SimpleBrowserOptions = {}): Promise<string> {
     const provider = this.resolveProvider(options.provider);
-    const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+    const lease = await this.acquireBrowserReadLease(options, "read from the shared Chrome session");
     try {
-      const page = selectCurrentPage(browser, provider, await this.conversations.preferredUrl(provider));
-      return await page.content();
+      const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+      try {
+        const page = selectCurrentPage(browser, provider, await this.conversations.preferredUrl(provider));
+        return await page.content();
+      } finally {
+        await browser.close();
+      }
     } finally {
-      await browser.close();
+      await lease.release();
     }
   }
 
   async screenshot(output?: string, options: SimpleBrowserOptions = {}): Promise<string> {
     const provider = this.resolveProvider(options.provider);
-    const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+    const lease = await this.acquireBrowserReadLease(options, "capture the shared Chrome session");
     try {
-      const page = selectCurrentPage(browser, provider, await this.conversations.preferredUrl(provider));
-      const screenshotPath = output ? path.resolve(output) : this.defaultScreenshotPath(provider);
-      await fs.promises.mkdir(path.dirname(screenshotPath), { recursive: true });
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      return screenshotPath;
+      const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+      try {
+        const page = selectCurrentPage(browser, provider, await this.conversations.preferredUrl(provider));
+        const screenshotPath = output ? path.resolve(output) : this.defaultScreenshotPath(provider);
+        await fs.promises.mkdir(path.dirname(screenshotPath), { recursive: true });
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        return screenshotPath;
+      } finally {
+        await browser.close();
+      }
     } finally {
-      await browser.close();
+      await lease.release();
     }
   }
 
@@ -282,6 +414,12 @@ export class AskApp {
           `Run \`ask login --provider ${provider.name}\`, then \`ask status --provider ${provider.name}\`.`
       );
     }
+  }
+
+  private async acquireBrowserReadLease(options: SimpleBrowserOptions, action: string) {
+    const session = await this.chromeSession.inspect(this.chromeOptions(options));
+    const headless = options.headless === true ? true : Boolean(session.headless);
+    return this.executionQueue.acquireBrowserLease({ headless, action });
   }
 
   private async assertSignedInBeforeSend(page: Page, provider: ProviderDefinition, options: SimpleBrowserOptions): Promise<void> {

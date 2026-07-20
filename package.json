@@ -9,7 +9,9 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "vitest run",
+    "test": "npm run build && vitest run",
+    "test:browser": "npm run build && vitest run test/real-browser-parallel.test.ts",
+    "test:live:parallel": "npm run build && vitest run test/live-chatgpt-parallel.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

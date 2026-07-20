@@ -52,24 +52,44 @@ export function getSessionLockPath(env: NodeJS.ProcessEnv = process.env): string
   return path.join(getAskHome(env), "chrome-manager.lock");
 }
 
+const SESSION_LOCK_WAIT_MS = 35_000;
+const SESSION_LOCK_STALE_MS = 60_000;
+
 export async function withSessionLock<T>(env: NodeJS.ProcessEnv, fn: () => Promise<T>): Promise<T> {
   await fs.promises.mkdir(getAskHome(env), { recursive: true });
   const lockPath = getSessionLockPath(env);
+  const deadline = Date.now() + SESSION_LOCK_WAIT_MS;
   let handle: fs.promises.FileHandle | undefined;
+
+  while (!handle) {
+    try {
+      handle = await fs.promises.open(lockPath, "wx");
+      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+    } catch (error) {
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") {
+        throw error;
+      }
+      try {
+        const stat = await fs.promises.stat(lockPath);
+        if (Date.now() - stat.mtimeMs > SESSION_LOCK_STALE_MS) {
+          await fs.promises.rm(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("Timed out waiting for another ask Chrome session operation to finish.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   try {
-    handle = await fs.promises.open(lockPath, "wx");
-    await handle.writeFile(`${process.pid}\n`, "utf8");
     return await fn();
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "EEXIST") {
-      throw new Error("Another ask Chrome session operation is already in progress. Try again in a few seconds.");
-    }
-    throw error;
   } finally {
-    if (handle) {
-      await handle.close().catch(() => undefined);
-      await fs.promises.rm(lockPath, { force: true }).catch(() => undefined);
-    }
+    await handle.close().catch(() => undefined);
+    await fs.promises.rm(lockPath, { force: true }).catch(() => undefined);
   }
 }
 export function normalizePathForCompare(value: string): string {
@@ -160,7 +180,13 @@ export async function getProcessInfo(pid: number): Promise<ProcessInfo | undefin
 
   try {
     process.kill(pid, 0);
-    return { pid };
+    try {
+      const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="]);
+      const creationTime = stdout.trim();
+      return { pid, creationTime: creationTime || undefined };
+    } catch {
+      return { pid };
+    }
   } catch {
     return undefined;
   }

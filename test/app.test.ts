@@ -1,8 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Page } from "playwright-core";
+import type { ProviderDefinition } from "../src/providers";
+import type { ExecutionQueue } from "../src/execution-queue";
 
 const state = vi.hoisted(() => ({
   events: [] as string[],
   page: {
+    bringToFront: vi.fn<() => Promise<void>>(async () => undefined),
+    close: vi.fn<() => Promise<void>>(async () => undefined),
     screenshot: vi.fn<() => Promise<void>>(async () => undefined),
     content: vi.fn<() => Promise<string>>(async () => "<html></html>"),
     url: vi.fn<() => string>(() => "https://chatgpt.com/")
@@ -16,7 +21,29 @@ const state = vi.hoisted(() => ({
     ])
   },
   input: {},
+  namedConversationExists: true,
+  browserLeaseRelease: vi.fn<() => Promise<void>>(async () => undefined),
+  conversationLeaseRelease: vi.fn<() => Promise<void>>(async () => undefined),
+  acquireBrowserLease: vi.fn(),
+  acquireConversationLease: vi.fn(),
+  forgetConversation: vi.fn<() => Promise<boolean>>(async () => true),
+  rememberConversation: vi.fn<(
+    provider: ProviderDefinition,
+    page: Page,
+    conversationName?: string
+  ) => Promise<void>>(async () => undefined),
   resolveWait: undefined as undefined | ((value: { text: string; timedOut: boolean }) => void)
+}));
+
+vi.mock("../src/execution-queue", () => ({
+  createExecutionQueue: vi.fn(() => ({
+    acquire: vi.fn(async () => ({ id: "test-execution", release: vi.fn(async () => undefined) })),
+    acquireBrowserLease: state.acquireBrowserLease,
+    acquireConversationLease: state.acquireConversationLease,
+    inspect: vi.fn(async () => ({ active: 0, queued: 0 })),
+    assertNoActive: vi.fn(async () => undefined),
+    assertConversationIdle: vi.fn(async () => undefined)
+  }))
 }));
 
 vi.mock("../src/browser", () => {
@@ -50,6 +77,15 @@ vi.mock("../src/conversations", () => {
       resolve: vi.fn(async (browser, provider, request) => {
         const savedUrl = await readLastConversationUrl();
         const preferredUrl = savedUrl && provider.matchesConversationUrl(savedUrl) ? savedUrl : undefined;
+        if (request.conversationName) {
+          const newSession = request.newSession === true || !state.namedConversationExists;
+          return {
+            newSession,
+            url: newSession ? provider.homeUrl : (preferredUrl || provider.homeUrl),
+            preferredUrl,
+            conversationName: request.conversationName
+          };
+        }
         if (request.newSession !== false) {
           return { newSession: request.newSession, url: request.requestedUrl, preferredUrl };
         }
@@ -71,11 +107,13 @@ vi.mock("../src/conversations", () => {
         const savedUrl = await readLastConversationUrl();
         return savedUrl && provider.matchesConversationUrl(savedUrl) ? savedUrl : undefined;
       }),
-      remember: vi.fn(async (provider, page) => {
+      remember: state.rememberConversation.mockImplementation(async (provider, page) => {
         if (provider.matchesConversationUrl(page.url())) {
           await writeLastConversationUrl();
         }
-      })
+      }),
+      list: vi.fn(async () => []),
+      forget: state.forgetConversation
     })),
     readLastConversationUrl,
     writeLastConversationUrl
@@ -94,6 +132,7 @@ vi.mock("../src/webchat", () => {
     readyForHeadless: true
   }));
   const submitPrompt = vi.fn(async () => undefined);
+  const stopAssistantGeneration = vi.fn(async () => undefined);
   const waitForAssistantCompletion = vi.fn(
     () =>
       new Promise<{ text: string; timedOut: boolean }>((resolve) => {
@@ -114,7 +153,8 @@ vi.mock("../src/webchat", () => {
       submitPrompt,
       extractLatestAssistantText,
       captureAssistantResponseBaseline,
-      waitForAssistantCompletion
+      waitForAssistantCompletion,
+      stopAssistantGeneration
     })),
     extractLatestAssistantText,
     fillPrompt,
@@ -123,6 +163,7 @@ vi.mock("../src/webchat", () => {
     openWorkerPage: vi.fn(async () => state.page),
     selectCurrentPage: vi.fn(() => state.page),
     submitPrompt,
+    stopAssistantGeneration,
     waitForAssistantCompletion
   };
 });
@@ -137,6 +178,7 @@ const {
   captureAssistantResponseBaseline,
   fillPrompt,
   inspectPage: inspectProviderPage,
+  stopAssistantGeneration,
   submitPrompt,
   waitForAssistantCompletion
 } = providerRegistry.chatgpt.automation;
@@ -145,7 +187,17 @@ describe("AskApp", () => {
   beforeEach(() => {
     state.events = [];
     state.resolveWait = undefined;
+    state.namedConversationExists = true;
     vi.clearAllMocks();
+    state.acquireBrowserLease.mockResolvedValue({
+      id: "test-browser",
+      release: state.browserLeaseRelease
+    });
+    state.acquireConversationLease.mockResolvedValue({
+      id: "test-conversation",
+      release: state.conversationLeaseRelease
+    });
+    state.forgetConversation.mockResolvedValue(true);
     state.browser.close.mockImplementation(async () => {
       state.events.push("close");
     });
@@ -191,6 +243,22 @@ describe("AskApp", () => {
       expect.objectContaining({ name: "chatgpt" }),
       "https://chatgpt.com/"
     );
+    expect(state.acquireBrowserLease).toHaveBeenCalledWith({
+      headless: false,
+      exclusive: true,
+      action: "log in or change the shared Chrome session"
+    });
+    expect(state.browserLeaseRelease).toHaveBeenCalledOnce();
+  });
+
+  it("holds the conversation lease until forgetting the name finishes", async () => {
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    await expect(app.forgetConversation("release", "chatgpt")).resolves.toBe(true);
+
+    expect(state.acquireConversationLease).toHaveBeenCalledWith("chatgpt", "release");
+    expect(state.forgetConversation).toHaveBeenCalledWith("chatgpt", "release");
+    expect(state.conversationLeaseRelease).toHaveBeenCalledOnce();
   });
 
   it("rejects headless login because manual auth requires a visible browser", async () => {
@@ -350,6 +418,51 @@ describe("AskApp", () => {
     expect(waitForAssistantCompletion).not.toHaveBeenCalled();
   });
 
+  it("releases the execution slot when prompt setup fails", async () => {
+    const release = vi.fn(async () => undefined);
+    const queue: ExecutionQueue = {
+      acquire: vi.fn(async () => ({ id: "lease", release })),
+      acquireBrowserLease: vi.fn(async () => ({ id: "browser-lease", release: vi.fn(async () => undefined) })),
+      acquireConversationLease: vi.fn(async () => ({ id: "conversation-lease", release: vi.fn(async () => undefined) })),
+      inspect: vi.fn(async () => ({ active: 1, queued: 0 })),
+      assertNoActive: vi.fn(async () => undefined),
+      assertConversationIdle: vi.fn(async () => undefined)
+    };
+    vi.mocked(inspectProviderPage).mockResolvedValue({
+      promptInputVisible: true,
+      authState: "guest",
+      readyToSend: true,
+      readyForHeadless: false
+    });
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv, executionQueue: queue });
+
+    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toThrow("auth: guest");
+
+    expect(release).toHaveBeenCalledOnce();
+    expect(state.page.close).toHaveBeenCalledOnce();
+  });
+
+  it("allows scheduled executions to coordinate a shared Chrome mode change", async () => {
+    const release = vi.fn(async () => undefined);
+    const queue: ExecutionQueue = {
+      acquire: vi.fn(async () => ({ id: "lease", release })),
+      acquireBrowserLease: vi.fn(async () => ({ id: "browser-lease", release: vi.fn(async () => undefined) })),
+      acquireConversationLease: vi.fn(async () => ({ id: "conversation-lease", release: vi.fn(async () => undefined) })),
+      inspect: vi.fn(async () => ({ active: 2, queued: 0 })),
+      assertNoActive: vi.fn(async () => undefined),
+      assertConversationIdle: vi.fn(async () => undefined)
+    };
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv, executionQueue: queue });
+
+    const resultPromise = app.ask({ prompt: "hi", attachments: [], headless: true, timeoutMs: 1000 });
+    await vi.waitFor(() => expect(state.resolveWait).toBeDefined());
+    state.resolveWait?.({ text: "hello", timedOut: false });
+
+    await expect(resultPromise).resolves.toMatchObject({ text: "hello" });
+    expect(connectToChrome).toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it.each(["login-required", "blocked", "unknown"] as const)("rejects visible prompts when provider auth is %s", async (authState) => {
     vi.mocked(inspectProviderPage).mockResolvedValue({
       promptInputVisible: authState !== "login-required",
@@ -393,6 +506,23 @@ describe("AskApp", () => {
     expect(inspectProviderPage).not.toHaveBeenCalled();
     expect(fillPrompt).toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
+  });
+
+  it("requires --send when open creates a named conversation", async () => {
+    state.namedConversationExists = false;
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    await expect(app.open({
+      url: "https://chatgpt.com/",
+      prompt: "hi",
+      attachments: [],
+      conversationName: "research",
+      newSession: false,
+      send: false,
+      timeoutMs: 1000
+    })).rejects.toThrow("Use `ask open --send --conversation <name> <prompt>`");
+
+    expect(openChatPage).not.toHaveBeenCalled();
   });
 
   it("keeps the browser connection open until response polling finishes", async () => {
@@ -447,6 +577,49 @@ describe("AskApp", () => {
     });
   });
 
+  it("stops and closes a timed-out execution without saving its conversation", async () => {
+    state.page.url.mockImplementation(() => "https://chatgpt.com/c/partial");
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    const resultPromise = app.ask({
+      prompt: "hi",
+      attachments: [],
+      conversationName: "partial",
+      timeoutMs: 1000
+    });
+
+    await vi.waitFor(() => expect(state.resolveWait).toBeDefined());
+    state.resolveWait?.({ text: "partial answer", timedOut: true });
+
+    await expect(resultPromise).resolves.toEqual({ text: "partial answer", timedOut: true });
+    expect(stopAssistantGeneration).toHaveBeenCalledWith(state.page);
+    expect(state.rememberConversation).not.toHaveBeenCalled();
+    expect(state.page.close).toHaveBeenCalledOnce();
+  });
+
+  it("binds a named conversation after receiving a valid conversation URL", async () => {
+    state.page.url.mockImplementation(() => "https://chatgpt.com/c/release");
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    const resultPromise = app.ask({
+      prompt: "hi",
+      attachments: [],
+      conversationName: "release-notes",
+      newSession: false,
+      timeoutMs: 1000
+    });
+
+    await vi.waitFor(() => expect(state.resolveWait).toBeDefined());
+    state.resolveWait?.({ text: "hello", timedOut: false });
+    await resultPromise;
+
+    expect(state.rememberConversation).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "chatgpt" }),
+      state.page,
+      "release-notes"
+    );
+  });
+
   it("starts a new conversation when continuation was requested but none exists", async () => {
     state.page.url.mockImplementation(() => "about:blank");
     const onContinuationUnavailable = vi.fn();
@@ -468,8 +641,7 @@ describe("AskApp", () => {
     expect(openWorkerPage).toHaveBeenCalledWith(
       state.browser,
       expect.objectContaining({ name: "chatgpt" }),
-      "https://chatgpt.com/",
-      undefined
+      "https://chatgpt.com/"
     );
   });
 });

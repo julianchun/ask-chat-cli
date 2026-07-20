@@ -231,7 +231,7 @@ describe("provider automation", () => {
     expect(context.createdPages).toBe(1);
   });
 
-  it("reuses the persisted worker page for a fresh conversation without foregrounding it", async () => {
+  it("creates a dedicated worker page without foregrounding it", async () => {
     const worker = new FakePage("https://chatgpt.com/c/previous");
     const other = new FakePage("https://chatgpt.com/c/other");
     const context = new FakeContext([other, worker]);
@@ -240,37 +240,34 @@ describe("provider automation", () => {
     const page = await openWorkerPage(
       browser as unknown as Browser,
       providerRegistry.chatgpt,
-      "https://chatgpt.com/",
-      "https://chatgpt.com/c/previous"
+      "https://chatgpt.com/"
     );
 
-    expect(page).toBe(worker);
-    expect(worker.url()).toBe("https://chatgpt.com/");
-    expect(worker.broughtToFront).toBe(false);
-    expect(context.createdPages).toBe(0);
+    expect(page).not.toBe(worker);
+    expect(page).not.toBe(other);
+    expect(page.url()).toBe("https://chatgpt.com/");
+    expect((page as unknown as FakePage).broughtToFront).toBe(false);
+    expect(context.createdPages).toBe(1);
   });
 
-  it("keeps repeated fresh conversations bounded to one worker page", async () => {
+  it("isolates repeated executions in separate worker pages", async () => {
     const worker = new FakePage("https://chatgpt.com/c/initial");
     const context = new FakeContext([worker]);
     const browser = new FakeBrowser(context);
-    let preferredUrl = worker.url();
+    const pages = new Set<FakePage>();
 
-    for (let index = 0; index < 20; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       const page = await openWorkerPage(
         browser as unknown as Browser,
         providerRegistry.chatgpt,
-        "https://chatgpt.com/",
-        preferredUrl
+        "https://chatgpt.com/"
       );
-      expect(page).toBe(worker);
-      await worker.goto(`https://chatgpt.com/c/generated-${index}`);
-      preferredUrl = worker.url();
+      pages.add(page as unknown as FakePage);
     }
 
-    expect(context.pages()).toHaveLength(1);
-    expect(context.createdPages).toBe(0);
-    expect(worker.broughtToFront).toBe(false);
+    expect(pages).toHaveLength(4);
+    expect(context.createdPages).toBe(4);
+    expect(worker.url()).toBe("https://chatgpt.com/c/initial");
   });
 
   it("reuses an existing Gemini page when Chrome restores multiple tabs", async () => {

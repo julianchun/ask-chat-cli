@@ -273,8 +273,14 @@ export async function closeChromeOnPort(port: number, options: ChromeLaunchOptio
 async function restartInMode(port: number, options: ChromeLaunchOptions, headless: boolean): Promise<void> {
   const env = options.env || process.env;
   await withSessionLock(env, async () => {
-    await closeChromeOnPort(port, options);
-    await waitForRemoteDebuggingToClose(port);
+    const currentVersion = await getRemoteDebuggingVersion(port);
+    if (currentVersion && isHeadlessRemoteDebugging(currentVersion) === headless) {
+      return;
+    }
+    if (currentVersion) {
+      await closeChromeOnPort(port, options);
+      await waitForRemoteDebuggingToClose(port);
+    }
     await launchChrome({ ...options, env, port, headless });
     await waitForRemoteDebugging(port);
   });

@@ -18,7 +18,8 @@ function createProviderAutomation(config) {
         submitPrompt: (page, input, timeoutMs) => submitPrompt(page, config, input, timeoutMs),
         extractLatestAssistantText: (page) => extractLatestAssistantText(page, config),
         captureAssistantResponseBaseline: (page) => captureAssistantResponseBaseline(page, config),
-        waitForAssistantCompletion: (page, options) => waitForAssistantCompletion(page, config, options)
+        waitForAssistantCompletion: (page, options) => waitForAssistantCompletion(page, config, options),
+        stopAssistantGeneration: (page) => stopAssistantGeneration(page, config)
     };
 }
 function getDefaultContext(browser) {
@@ -39,9 +40,9 @@ async function openChatPage(browser, provider, url = provider.homeUrl, options =
     await page.bringToFront();
     return page;
 }
-async function openWorkerPage(browser, provider, url = provider.homeUrl, preferredUrl) {
+async function openWorkerPage(browser, provider, url = provider.homeUrl) {
     const context = getDefaultContext(browser);
-    const page = selectReusableChatPage(context, provider, url, preferredUrl) || (await context.newPage());
+    const page = await context.newPage();
     if (!sameUrl(page.url(), url)) {
         await page.goto(url, { waitUntil: "domcontentloaded" });
     }
@@ -477,6 +478,20 @@ async function isStreaming(page, provider) {
         }
     }
     return false;
+}
+async function stopAssistantGeneration(page, provider) {
+    for (const selector of provider.stopButtonSelectors) {
+        try {
+            const button = page.locator(selector).last();
+            if ((await button.count()) > 0 && (await button.isVisible()) && (await button.isEnabled())) {
+                await button.click();
+                return;
+            }
+        }
+        catch {
+            // Stopping is best effort; closing the execution tab is the final cleanup.
+        }
+    }
 }
 async function waitForAssistantCompletion(page, provider, options) {
     const stableMs = options.stableMs ?? 4_000;

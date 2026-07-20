@@ -73,14 +73,20 @@ describe("session ownership helpers", () => {
     ).toBe(false);
   });
 
-  it("prevents concurrent session manager operations", async () => {
-    await expect(
-      withSessionLock(env, async () => {
-        await expect(fs.promises.access(getSessionLockPath(env))).resolves.toBeUndefined();
-        await expect(withSessionLock(env, async () => undefined)).rejects.toThrow("already in progress");
-      })
-    ).resolves.toBeUndefined();
+  it("waits for concurrent session manager operations", async () => {
+    const order: string[] = [];
+    let second: Promise<void> | undefined;
+    await withSessionLock(env, async () => {
+      await expect(fs.promises.access(getSessionLockPath(env))).resolves.toBeUndefined();
+      second = withSessionLock(env, async () => {
+        order.push("second");
+      });
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      order.push("first");
+    });
+    await second;
 
+    expect(order).toEqual(["first", "second"]);
     await expect(fs.promises.access(getSessionLockPath(env))).rejects.toThrow();
   });
 
