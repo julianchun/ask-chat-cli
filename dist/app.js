@@ -9,6 +9,7 @@ const node_path_1 = __importDefault(require("node:path"));
 const browser_1 = require("./browser");
 const config_1 = require("./config");
 const conversations_1 = require("./conversations");
+const execution_queue_1 = require("./execution-queue");
 const io_1 = require("./io");
 const providers_1 = require("./providers");
 const webchat_1 = require("./webchat");
@@ -17,131 +18,257 @@ class AskApp {
     env;
     chromeSession;
     conversations;
+    executionQueue;
     constructor(options = {}) {
         this.env = options.env || process.env;
         this.chromeSession = options.chromeSession || (0, browser_1.createChromeSessionController)(this.env);
         this.conversations = options.conversationContinuity || (0, conversations_1.createConversationContinuity)(this.env);
+        this.executionQueue = options.executionQueue || (0, execution_queue_1.createExecutionQueue)(this.env);
     }
     async login(options = {}) {
         if (options.headless) {
             throw new Error("`ask login` requires a visible browser. Use `ask login --provider <provider>` without --headless.");
         }
-        const provider = this.resolveProvider(options.provider);
-        const browser = await this.chromeSession.connect({
-            ...this.chromeOptions({ ...options, headless: false }),
-            requireManaged: true,
-            requireVisible: true,
-            url: provider.homeUrl
+        const lease = await this.executionQueue.acquireBrowserLease({
+            headless: false,
+            exclusive: true,
+            action: "log in or change the shared Chrome session"
         });
         try {
-            await (0, webchat_1.openChatPage)(browser, provider, provider.homeUrl);
+            const provider = this.resolveProvider(options.provider);
+            const browser = await this.chromeSession.connect({
+                ...this.chromeOptions({ ...options, headless: false }),
+                requireManaged: true,
+                requireVisible: true,
+                url: provider.homeUrl
+            });
+            try {
+                await (0, webchat_1.openChatPage)(browser, provider, provider.homeUrl);
+            }
+            finally {
+                await browser.close();
+            }
         }
         finally {
-            await browser.close();
+            await lease.release();
         }
     }
     async open(options) {
         const provider = this.resolveProvider(options.provider);
-        await this.assertHeadlessAllowedIfNeeded(provider, options);
-        const browser = await this.chromeSession.connect({
-            ...this.chromeOptions(options),
-            requireManaged: true,
-            requireVisible: !options.headless,
-            url: options.url
+        if (options.send) {
+            return this.openAndSend(provider, options);
+        }
+        const lease = await this.executionQueue.acquireBrowserLease({
+            headless: Boolean(options.headless),
+            action: "open the shared Chrome session in a different mode"
         });
         try {
-            const session = await this.conversations.resolve(browser, provider, {
-                requestedUrl: options.url,
-                newSession: options.newSession,
-                onContinuationUnavailable: options.onContinuationUnavailable
+            await this.assertHeadlessAllowedIfNeeded(provider, options);
+            const browser = await this.chromeSession.connect({
+                ...this.chromeOptions(options),
+                requireManaged: true,
+                requireVisible: !options.headless,
+                url: options.url
             });
-            const page = await (0, webchat_1.openChatPage)(browser, provider, session.url, { newSession: session.newSession });
-            if (options.send) {
-                if (!options.prompt) {
-                    throw new Error("`ask open --send` requires a prompt.");
+            try {
+                const session = await this.conversations.resolve(browser, provider, {
+                    requestedUrl: options.url,
+                    newSession: options.newSession,
+                    conversationName: options.conversationName,
+                    onContinuationUnavailable: options.onContinuationUnavailable
+                });
+                if (session.conversationName && session.newSession && !options.send) {
+                    throw new Error(`Named conversation \"${session.conversationName}\" does not exist yet. ` +
+                        "Use `ask open --send --conversation <name> <prompt>` so ask can save the new conversation URL.");
                 }
-                await this.assertSignedInBeforeSend(page, provider, options);
-            }
-            await provider.automation.attachFiles(page, options.attachments);
-            if (options.prompt) {
-                const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
-                if (options.send) {
-                    await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
+                const page = await (0, webchat_1.openChatPage)(browser, provider, session.url, { newSession: true });
+                await provider.automation.attachFiles(page, options.attachments);
+                if (options.prompt) {
+                    await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
                 }
+                await this.conversations.remember(provider, page, session.conversationName);
             }
-            await this.conversations.remember(provider, page);
+            finally {
+                await browser.close();
+            }
         }
         finally {
-            await browser.close();
+            await lease.release();
         }
     }
     async ask(options) {
         const provider = this.resolveProvider(options.provider);
-        await this.assertHeadlessAllowedIfNeeded(provider, options);
-        const browser = await this.chromeSession.connect({
-            ...this.chromeOptions(options),
-            requireManaged: true,
-            requireVisible: !options.headless,
-            url: provider.homeUrl
+        const lease = await this.executionQueue.acquire({
+            provider: provider.name,
+            conversationName: options.conversationName,
+            exclusiveProvider: options.newSession === false && !options.conversationName,
+            headless: options.headless,
+            onUpdate: options.onQueueUpdate
         });
         try {
-            const session = await this.conversations.resolve(browser, provider, {
-                requestedUrl: provider.homeUrl,
-                newSession: options.newSession,
-                onContinuationUnavailable: options.onContinuationUnavailable
+            await this.assertHeadlessAllowedIfNeeded(provider, options);
+            const browser = await this.chromeSession.connect({
+                ...this.chromeOptions(options),
+                requireManaged: true,
+                requireVisible: !options.headless,
+                url: provider.homeUrl
             });
-            const page = await (0, webchat_1.openWorkerPage)(browser, provider, session.url, session.preferredUrl);
-            await this.assertSignedInBeforeSend(page, provider, options);
-            await provider.automation.attachFiles(page, options.attachments);
-            const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
-            const baseline = await provider.automation.captureAssistantResponseBaseline(page);
-            await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
-            const result = await provider.automation.waitForAssistantCompletion(page, { timeoutMs: options.timeoutMs, baseline });
-            await this.conversations.remember(provider, page);
-            const conversationUrl = page.url();
-            return {
-                ...result,
-                ...(provider.matchesConversationUrl(conversationUrl) ? { conversationUrl } : {})
-            };
+            try {
+                const session = await this.conversations.resolve(browser, provider, {
+                    requestedUrl: provider.homeUrl,
+                    newSession: options.newSession,
+                    conversationName: options.conversationName,
+                    onContinuationUnavailable: options.onContinuationUnavailable
+                });
+                const page = await (0, webchat_1.openWorkerPage)(browser, provider, session.url);
+                try {
+                    await this.assertSignedInBeforeSend(page, provider, options);
+                    await provider.automation.attachFiles(page, options.attachments);
+                    const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
+                    const baseline = await provider.automation.captureAssistantResponseBaseline(page);
+                    await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
+                    const result = await provider.automation.waitForAssistantCompletion(page, { timeoutMs: options.timeoutMs, baseline });
+                    if (result.timedOut) {
+                        await provider.automation.stopAssistantGeneration(page);
+                        return result;
+                    }
+                    await this.conversations.remember(provider, page, session.conversationName);
+                    const conversationUrl = page.url();
+                    return {
+                        ...result,
+                        ...(provider.matchesConversationUrl(conversationUrl) ? { conversationUrl } : {})
+                    };
+                }
+                finally {
+                    await page.close().catch(() => undefined);
+                }
+            }
+            finally {
+                await browser.close();
+            }
         }
         finally {
-            await browser.close();
+            await lease.release();
         }
     }
     async get(options = {}) {
         const provider = this.resolveProvider(options.provider);
-        const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+        const lease = await this.acquireBrowserReadLease(options, "read from the shared Chrome session");
         try {
-            const page = (0, webchat_1.selectCurrentPage)(browser, provider, await this.conversations.preferredUrl(provider));
-            return await provider.automation.extractLatestAssistantText(page);
+            const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+            try {
+                const page = (0, webchat_1.selectCurrentPage)(browser, provider, await this.conversations.preferredUrl(provider));
+                return await provider.automation.extractLatestAssistantText(page);
+            }
+            finally {
+                await browser.close();
+            }
         }
         finally {
-            await browser.close();
+            await lease.release();
+        }
+    }
+    async listConversations(providerName) {
+        return this.conversations.list(providerName);
+    }
+    async forgetConversation(name, providerName) {
+        const provider = this.resolveProvider(providerName);
+        const lease = await this.executionQueue.acquireConversationLease(provider.name, name);
+        try {
+            return await this.conversations.forget(provider.name, name);
+        }
+        finally {
+            await lease.release();
+        }
+    }
+    async openAndSend(provider, options) {
+        if (!options.prompt) {
+            throw new Error("`ask open --send` requires a prompt.");
+        }
+        const lease = await this.executionQueue.acquire({
+            provider: provider.name,
+            conversationName: options.conversationName,
+            exclusiveProvider: options.newSession === false && !options.conversationName,
+            headless: options.headless,
+            onUpdate: options.onQueueUpdate
+        });
+        try {
+            await this.assertHeadlessAllowedIfNeeded(provider, options);
+            const browser = await this.chromeSession.connect({
+                ...this.chromeOptions(options),
+                requireManaged: true,
+                requireVisible: true,
+                url: options.url
+            });
+            try {
+                const session = await this.conversations.resolve(browser, provider, {
+                    requestedUrl: options.url,
+                    newSession: options.newSession,
+                    conversationName: options.conversationName,
+                    onContinuationUnavailable: options.onContinuationUnavailable
+                });
+                const page = await (0, webchat_1.openWorkerPage)(browser, provider, session.url);
+                try {
+                    await page.bringToFront();
+                    await this.assertSignedInBeforeSend(page, provider, options);
+                    await provider.automation.attachFiles(page, options.attachments);
+                    const input = await provider.automation.fillPrompt(page, options.prompt, Math.min(options.timeoutMs, 30_000));
+                    const baseline = await provider.automation.captureAssistantResponseBaseline(page);
+                    await provider.automation.submitPrompt(page, input, Math.min(options.timeoutMs, 30_000));
+                    const result = await provider.automation.waitForAssistantCompletion(page, { timeoutMs: options.timeoutMs, baseline });
+                    if (result.timedOut) {
+                        await provider.automation.stopAssistantGeneration(page);
+                        throw new Error(`Timed out waiting for ${provider.displayName}; the execution tab was closed.`);
+                    }
+                    await this.conversations.remember(provider, page, session.conversationName);
+                }
+                finally {
+                    await page.close().catch(() => undefined);
+                }
+            }
+            finally {
+                await browser.close();
+            }
+        }
+        finally {
+            await lease.release();
         }
     }
     async dump(options = {}) {
         const provider = this.resolveProvider(options.provider);
-        const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+        const lease = await this.acquireBrowserReadLease(options, "read from the shared Chrome session");
         try {
-            const page = (0, webchat_1.selectCurrentPage)(browser, provider, await this.conversations.preferredUrl(provider));
-            return await page.content();
+            const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+            try {
+                const page = (0, webchat_1.selectCurrentPage)(browser, provider, await this.conversations.preferredUrl(provider));
+                return await page.content();
+            }
+            finally {
+                await browser.close();
+            }
         }
         finally {
-            await browser.close();
+            await lease.release();
         }
     }
     async screenshot(output, options = {}) {
         const provider = this.resolveProvider(options.provider);
-        const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+        const lease = await this.acquireBrowserReadLease(options, "capture the shared Chrome session");
         try {
-            const page = (0, webchat_1.selectCurrentPage)(browser, provider, await this.conversations.preferredUrl(provider));
-            const screenshotPath = output ? node_path_1.default.resolve(output) : this.defaultScreenshotPath(provider);
-            await node_fs_1.default.promises.mkdir(node_path_1.default.dirname(screenshotPath), { recursive: true });
-            await page.screenshot({ path: screenshotPath, fullPage: true });
-            return screenshotPath;
+            const browser = await this.chromeSession.connect({ ...this.chromeOptions(options), launchIfNeeded: false, requireManaged: true });
+            try {
+                const page = (0, webchat_1.selectCurrentPage)(browser, provider, await this.conversations.preferredUrl(provider));
+                const screenshotPath = output ? node_path_1.default.resolve(output) : this.defaultScreenshotPath(provider);
+                await node_fs_1.default.promises.mkdir(node_path_1.default.dirname(screenshotPath), { recursive: true });
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+                return screenshotPath;
+            }
+            finally {
+                await browser.close();
+            }
         }
         finally {
-            await browser.close();
+            await lease.release();
         }
     }
     async status(options = {}) {
@@ -210,6 +337,11 @@ class AskApp {
             throw new Error(`${provider.displayName} is not ready for headless use (auth: ${status.authState}, prompt: ${status.promptInputVisible ? "found" : "not found"}). ` +
                 `Run \`ask login --provider ${provider.name}\`, then \`ask status --provider ${provider.name}\`.`);
         }
+    }
+    async acquireBrowserReadLease(options, action) {
+        const session = await this.chromeSession.inspect(this.chromeOptions(options));
+        const headless = options.headless === true ? true : Boolean(session.headless);
+        return this.executionQueue.acquireBrowserLease({ headless, action });
     }
     async assertSignedInBeforeSend(page, provider, options) {
         const inspection = await provider.automation.inspectPage(page, Math.min(options.timeoutMs || DEFAULT_STATUS_TIMEOUT_MS, DEFAULT_STATUS_TIMEOUT_MS));

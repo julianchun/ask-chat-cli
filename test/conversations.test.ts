@@ -3,7 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Browser } from "playwright-core";
-import { createConversationContinuity, readLastConversationUrl, writeLastConversationUrl } from "../src/conversations";
+import {
+  createConversationContinuity,
+  forgetNamedConversation,
+  listNamedConversations,
+  readLastConversationUrl,
+  readNamedConversationUrl,
+  writeLastConversationUrl
+} from "../src/conversations";
 import { providerRegistry } from "../src/providers";
 
 describe("conversation state", () => {
@@ -76,5 +83,105 @@ describe("conversation state", () => {
       onContinuationUnavailable: () => unavailable.push("called")
     })).resolves.toEqual({ newSession: true, url: provider.homeUrl });
     expect(unavailable).toEqual(["called"]);
+  });
+
+  it("creates, resumes, resets, lists, and forgets named conversations", async () => {
+    const continuity = createConversationContinuity(env);
+    const provider = providerRegistry.chatgpt;
+    const browser = { contexts: () => [{ pages: () => [] }] } as unknown as Browser;
+    const page = { url: () => "https://chatgpt.com/c/release" };
+
+    await expect(continuity.resolve(browser, provider, {
+      requestedUrl: provider.homeUrl,
+      newSession: false,
+      conversationName: "Release-Notes"
+    })).resolves.toMatchObject({
+      newSession: true,
+      url: provider.homeUrl,
+      conversationName: "release-notes"
+    });
+
+    await continuity.remember(provider, page as never, "release-notes");
+    await expect(readNamedConversationUrl(env, "chatgpt", "release-notes")).resolves.toBe(
+      "https://chatgpt.com/c/release"
+    );
+    await expect(continuity.resolve(browser, provider, {
+      requestedUrl: provider.homeUrl,
+      newSession: false,
+      conversationName: "release-notes"
+    })).resolves.toMatchObject({
+      newSession: false,
+      url: "https://chatgpt.com/c/release",
+      conversationName: "release-notes"
+    });
+    await expect(continuity.resolve(browser, provider, {
+      requestedUrl: provider.homeUrl,
+      newSession: true,
+      conversationName: "release-notes"
+    })).resolves.toMatchObject({ newSession: true, url: provider.homeUrl });
+
+    await expect(listNamedConversations(env, "chatgpt")).resolves.toEqual([
+      expect.objectContaining({
+        provider: "chatgpt",
+        name: "release-notes",
+        url: "https://chatgpt.com/c/release"
+      })
+    ]);
+    await expect(forgetNamedConversation(env, "chatgpt", "release-notes")).resolves.toBe(true);
+    await expect(readNamedConversationUrl(env, "chatgpt", "release-notes")).resolves.toBeUndefined();
+  });
+
+  it("migrates version 1 state when writing a named conversation", async () => {
+    await fs.promises.writeFile(
+      path.join(askHome, "conversations.json"),
+      JSON.stringify({ version: 1, urls: { chatgpt: "https://chatgpt.com/c/legacy" } }),
+      "utf8"
+    );
+    const continuity = createConversationContinuity(env);
+    const page = { url: () => "https://gemini.google.com/app/research" };
+
+    await continuity.remember(providerRegistry.gemini, page as never, "research");
+
+    await expect(readLastConversationUrl(env, "chatgpt")).resolves.toBe("https://chatgpt.com/c/legacy");
+    await expect(readNamedConversationUrl(env, "gemini", "research")).resolves.toBe(
+      "https://gemini.google.com/app/research"
+    );
+    const state = JSON.parse(await fs.promises.readFile(path.join(askHome, "conversations.json"), "utf8"));
+    expect(state.version).toBe(2);
+  });
+
+  it("keeps named conversations scoped by provider during concurrent writes", async () => {
+    const continuity = createConversationContinuity(env);
+    await Promise.all([
+      continuity.remember(providerRegistry.chatgpt, { url: () => "https://chatgpt.com/c/shared" } as never, "shared"),
+      continuity.remember(providerRegistry.gemini, { url: () => "https://gemini.google.com/app/shared" } as never, "shared")
+    ]);
+
+    await expect(readNamedConversationUrl(env, "chatgpt", "shared")).resolves.toBe("https://chatgpt.com/c/shared");
+    await expect(readNamedConversationUrl(env, "gemini", "shared")).resolves.toBe("https://gemini.google.com/app/shared");
+  });
+
+  it("does not bind a name until the page has a valid provider conversation URL", async () => {
+    const continuity = createConversationContinuity(env);
+
+    await continuity.remember(
+      providerRegistry.chatgpt,
+      { url: () => "https://chatgpt.com/" } as never,
+      "not-ready"
+    );
+
+    await expect(readNamedConversationUrl(env, "chatgpt", "not-ready")).resolves.toBeUndefined();
+  });
+
+  it("rejects two names for the same provider conversation URL", async () => {
+    const continuity = createConversationContinuity(env);
+    const page = { url: () => "https://chatgpt.com/c/shared" } as never;
+
+    await continuity.remember(providerRegistry.chatgpt, page, "research");
+
+    await expect(continuity.remember(providerRegistry.chatgpt, page, "notes")).rejects.toThrow(
+      'already named "research"'
+    );
+    await expect(readNamedConversationUrl(env, "chatgpt", "notes")).resolves.toBeUndefined();
   });
 });

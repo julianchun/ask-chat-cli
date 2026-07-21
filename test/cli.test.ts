@@ -49,7 +49,9 @@ function makeRunner(): Runner {
       readyForHeadless: true,
       loggedInLikely: true,
       note: "ChatGPT appears signed in and ready in the visible ask Chrome session."
-    }))
+    })),
+    listConversations: vi.fn(async () => []),
+    forgetConversation: vi.fn(async () => true)
   };
 }
 
@@ -89,6 +91,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined
     });
@@ -117,6 +120,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: true
     });
@@ -200,7 +204,7 @@ describe("cli", () => {
       exitCode: 0
     });
 
-    expect(stdout.text).toContain("after signed-in auth is confirmed");
+    expect(stdout.text).toContain("signed-in auth is confirmed");
     expect(stdout.text).toContain("--send");
     expect(stdout.text).toContain("--provider");
     expect(stdout.text).not.toContain("--headless");
@@ -219,6 +223,7 @@ describe("cli", () => {
       attachments: ["report.pdf", "data.csv"],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined
     });
@@ -258,6 +263,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined
     });
@@ -321,6 +327,22 @@ describe("cli", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("reports queued and admitted execution progress on stderr", async () => {
+    const runner = makeRunner();
+    vi.mocked(runner.ask).mockImplementation(async (options) => {
+      options.onQueueUpdate?.({ phase: "queued", position: 2, active: 4, queued: 2, waitedMs: 0 });
+      options.onQueueUpdate?.({ phase: "active", position: 0, active: 4, queued: 1, waitedMs: 100 });
+      return { text: "answer", timedOut: false };
+    });
+    const stderr = new BufferWriter();
+    const program = makeProgram(runner, { stderr });
+
+    await program.parseAsync(["node", "ask", "Plan this"]);
+
+    expect(stderr.text).toContain("ChatGPT · queued 2/4 · waiting for an execution slot");
+    expect(stderr.text).toContain("ChatGPT · execution slot acquired · starting…");
   });
 
   it("labels a continued conversation and prints its URL before the response", async () => {
@@ -391,6 +413,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined
     });
@@ -475,6 +498,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: true,
       send: false
@@ -494,6 +518,7 @@ describe("cli", () => {
       attachments: ["report.pdf"],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined,
       send: false
@@ -525,6 +550,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined,
       send: false
@@ -552,6 +578,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined,
       send: true
@@ -571,6 +598,7 @@ describe("cli", () => {
       attachments: [],
       headless: undefined,
       newSession: true,
+      onQueueUpdate: expect.any(Function),
       timeoutMs: 600000,
       verbose: undefined,
       send: false
@@ -715,6 +743,81 @@ describe("cli", () => {
       verbose: undefined
     });
   });
+
+  it("resumes a named conversation and allows --new to reset it", async () => {
+    const runner = makeRunner();
+    let program = makeProgram(runner);
+
+    await program.parseAsync(["node", "ask", "--conversation", "Release-Notes", "Draft", "this"]);
+
+    expect(runner.ask).toHaveBeenLastCalledWith(expect.objectContaining({
+      provider: "chatgpt",
+      prompt: "Draft this",
+      conversationName: "release-notes",
+      newSession: false
+    }));
+
+    program = makeProgram(runner);
+    await program.parseAsync(["node", "ask", "--conversation", "release-notes", "--new", "Restart"]);
+    expect(runner.ask).toHaveBeenLastCalledWith(expect.objectContaining({
+      conversationName: "release-notes",
+      newSession: true
+    }));
+  });
+
+  it("routes named conversations through open", async () => {
+    const runner = makeRunner();
+    const program = makeProgram(runner);
+
+    await program.parseAsync(["node", "ask", "open", "--conversation", "research", "Continue"]);
+
+    expect(runner.open).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: "Continue",
+      conversationName: "research",
+      newSession: false
+    }));
+  });
+
+  it("lists named conversations as JSON", async () => {
+    const runner = makeRunner();
+    vi.mocked(runner.listConversations).mockResolvedValue([{
+      provider: "chatgpt",
+      name: "release-notes",
+      url: "https://chatgpt.com/c/release",
+      updatedAt: "2026-07-15T12:00:00.000Z"
+    }]);
+    const stdout = new BufferWriter();
+    const program = makeProgram(runner, { stdout });
+
+    await program.parseAsync(["node", "ask", "conversations", "list", "--provider", "chatgpt", "--json"]);
+
+    expect(runner.listConversations).toHaveBeenCalledWith("chatgpt");
+    expect(JSON.parse(stdout.text)).toEqual([
+      expect.objectContaining({ name: "release-notes", provider: "chatgpt" })
+    ]);
+  });
+
+  it("forgets only the local named conversation", async () => {
+    const runner = makeRunner();
+    const stderr = new BufferWriter();
+    const program = makeProgram(runner, { stderr });
+
+    await program.parseAsync(["node", "ask", "conversations", "forget", "Release-Notes"]);
+
+    expect(runner.forgetConversation).toHaveBeenCalledWith("release-notes", "chatgpt");
+    expect(stderr.text).toContain("The provider chat was not deleted.");
+  });
+
+  it("rejects --conversation with --continue", async () => {
+    const runner = makeRunner();
+    const program = makeProgram(runner);
+
+    await expect(program.parseAsync([
+      "node", "ask", "--conversation", "release", "--continue", "Continue"
+    ])).rejects.toMatchObject({ code: "commander.conflictingOption" });
+    expect(runner.ask).not.toHaveBeenCalled();
+  });
+
   it("does not advertise the unimplemented image output option", async () => {
     const runner = makeRunner();
     const stdout = new BufferWriter();

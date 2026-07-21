@@ -34,26 +34,44 @@ function getProfileMarkerPath(env = process.env) {
 function getSessionLockPath(env = process.env) {
     return node_path_1.default.join((0, config_1.getAskHome)(env), "chrome-manager.lock");
 }
+const SESSION_LOCK_WAIT_MS = 35_000;
+const SESSION_LOCK_STALE_MS = 60_000;
 async function withSessionLock(env, fn) {
     await node_fs_1.default.promises.mkdir((0, config_1.getAskHome)(env), { recursive: true });
     const lockPath = getSessionLockPath(env);
+    const deadline = Date.now() + SESSION_LOCK_WAIT_MS;
     let handle;
+    while (!handle) {
+        try {
+            handle = await node_fs_1.default.promises.open(lockPath, "wx");
+            await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+        }
+        catch (error) {
+            if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") {
+                throw error;
+            }
+            try {
+                const stat = await node_fs_1.default.promises.stat(lockPath);
+                if (Date.now() - stat.mtimeMs > SESSION_LOCK_STALE_MS) {
+                    await node_fs_1.default.promises.rm(lockPath, { force: true });
+                    continue;
+                }
+            }
+            catch {
+                continue;
+            }
+            if (Date.now() >= deadline) {
+                throw new Error("Timed out waiting for another ask Chrome session operation to finish.");
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+    }
     try {
-        handle = await node_fs_1.default.promises.open(lockPath, "wx");
-        await handle.writeFile(`${process.pid}\n`, "utf8");
         return await fn();
     }
-    catch (error) {
-        if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
-            throw new Error("Another ask Chrome session operation is already in progress. Try again in a few seconds.");
-        }
-        throw error;
-    }
     finally {
-        if (handle) {
-            await handle.close().catch(() => undefined);
-            await node_fs_1.default.promises.rm(lockPath, { force: true }).catch(() => undefined);
-        }
+        await handle.close().catch(() => undefined);
+        await node_fs_1.default.promises.rm(lockPath, { force: true }).catch(() => undefined);
     }
 }
 function normalizePathForCompare(value) {
@@ -126,7 +144,14 @@ async function getProcessInfo(pid) {
     }
     try {
         process.kill(pid, 0);
-        return { pid };
+        try {
+            const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="]);
+            const creationTime = stdout.trim();
+            return { pid, creationTime: creationTime || undefined };
+        }
+        catch {
+            return { pid };
+        }
     }
     catch {
         return undefined;

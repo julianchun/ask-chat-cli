@@ -48,6 +48,7 @@ export interface ProviderAutomation {
   extractLatestAssistantText(page: Page): Promise<string>;
   captureAssistantResponseBaseline(page: Page): Promise<AssistantResponseBaseline>;
   waitForAssistantCompletion(page: Page, options: WaitForResponseOptions): Promise<ResponseResult>;
+  stopAssistantGeneration(page: Page): Promise<void>;
 }
 
 export interface ProviderAutomationConfig {
@@ -74,7 +75,8 @@ export function createProviderAutomation(config: ProviderAutomationConfig): Prov
     submitPrompt: (page, input, timeoutMs) => submitPrompt(page, config, input, timeoutMs),
     extractLatestAssistantText: (page) => extractLatestAssistantText(page, config),
     captureAssistantResponseBaseline: (page) => captureAssistantResponseBaseline(page, config),
-    waitForAssistantCompletion: (page, options) => waitForAssistantCompletion(page, config, options)
+    waitForAssistantCompletion: (page, options) => waitForAssistantCompletion(page, config, options),
+    stopAssistantGeneration: (page) => stopAssistantGeneration(page, config)
   };
 }
 
@@ -107,11 +109,10 @@ export async function openChatPage(
 export async function openWorkerPage(
   browser: Browser,
   provider: ProviderDefinition,
-  url = provider.homeUrl,
-  preferredUrl?: string
+  url = provider.homeUrl
 ): Promise<Page> {
   const context = getDefaultContext(browser);
-  const page = selectReusableChatPage(context, provider, url, preferredUrl) || (await context.newPage());
+  const page = await context.newPage();
   if (!sameUrl(page.url(), url)) {
     await page.goto(url, { waitUntil: "domcontentloaded" });
   }
@@ -653,6 +654,20 @@ async function isStreaming(page: Page, provider: ProviderAutomationConfig): Prom
   }
 
   return false;
+}
+
+async function stopAssistantGeneration(page: Page, provider: ProviderAutomationConfig): Promise<void> {
+  for (const selector of provider.stopButtonSelectors) {
+    try {
+      const button = page.locator(selector).last();
+      if ((await button.count()) > 0 && (await button.isVisible()) && (await button.isEnabled())) {
+        await button.click();
+        return;
+      }
+    } catch {
+      // Stopping is best effort; closing the execution tab is the final cleanup.
+    }
+  }
 }
 
 async function waitForAssistantCompletion(

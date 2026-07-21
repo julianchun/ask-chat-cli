@@ -6,6 +6,8 @@ const commander_1 = require("commander");
 const app_1 = require("./app");
 const args_1 = require("./args");
 const config_1 = require("./config");
+const conversations_1 = require("./conversations");
+const execution_queue_1 = require("./execution-queue");
 const errors_1 = require("./errors");
 const io_1 = require("./io");
 const providers_1 = require("./providers");
@@ -35,6 +37,7 @@ function createProgram(services = {}) {
     program.option("--new", "start a new conversation (now the default)");
     program.addOption(new commander_1.Option("--continue", "continue the previous provider conversation; starts a new one if unavailable")
         .conflicts("new"));
+    program.addOption(conversationOption());
     program
         .argument("[prompt...]", "prompt text; reads stdin when omitted")
         .action(async (promptParts, options) => {
@@ -49,8 +52,10 @@ function createProgram(services = {}) {
             }
             const provider = resolveCliProvider(options, program, env);
             const newSession = resolveNewSession(options, program);
+            const conversationName = resolveConversationName(options, program);
             const providerDisplayName = (0, providers_1.getProvider)(provider).displayName;
-            const stopWaitingProgress = startWaitingSpinner(stderr, providerDisplayName, newSession, env);
+            const queueProgress = createQueueProgress(stderr, providerDisplayName);
+            const stopWaitingProgress = startWaitingSpinner(stderr, providerDisplayName, newSession, env, () => queueProgress.current);
             let continuationUnavailable = false;
             let elapsedMs = 0;
             let result;
@@ -61,6 +66,7 @@ function createProgram(services = {}) {
                     attachments,
                     headless: options.headless,
                     newSession,
+                    ...(conversationName ? { conversationName } : {}),
                     ...(newSession ? {} : {
                         onContinuationUnavailable: () => {
                             continuationUnavailable = true;
@@ -69,6 +75,7 @@ function createProgram(services = {}) {
                             }
                         }
                     }),
+                    onQueueUpdate: queueProgress.update,
                     timeoutMs: options.timeout,
                     verbose: resolveVerbose(options, program)
                 });
@@ -116,16 +123,19 @@ function createProgram(services = {}) {
     const open = program
         .command("open [first] [rest...]")
         .description("Open a provider page, fill a prompt, and optionally send it after signed-in auth is confirmed.")
-        .option("--send", "submit the prompt after signed-in auth is confirmed and exit without waiting for the answer")
+        .option("--send", "submit the prompt and wait for completion after signed-in auth is confirmed")
         .option("--new", "start a new conversation (now the default)")
         .addOption(new commander_1.Option("--continue", "continue the previous provider conversation; starts a new one if unavailable")
-        .conflicts("new"));
+        .conflicts("new"))
+        .addOption(conversationOption());
     addCommonOptions(open, { includeOutput: false, includeAttachments: true, includeHeadless: false });
     open.action(async (first, rest, options) => {
         await runWithErrors(stderr, setExitCode, async () => {
             const provider = resolveCliProvider(options, program, env);
             const target = (0, args_1.resolveOpenTarget)(first, rest, provider);
             const newSession = resolveNewSession(options, program);
+            const conversationName = resolveConversationName(options, program);
+            const queueProgress = createQueueProgress(stderr, (0, providers_1.getProvider)(provider).displayName);
             writeProgress(stderr, `Opening ${(0, providers_1.getProvider)(provider).displayName} ${newSession ? "in a new conversation" : "in the previous conversation"}${options.send ? " and sending the prompt" : ""}…`);
             await runner.open({
                 provider,
@@ -134,16 +144,18 @@ function createProgram(services = {}) {
                 attachments: resolveAttachments(options, program),
                 headless: options.headless,
                 newSession,
+                ...(conversationName ? { conversationName } : {}),
                 ...(newSession ? {} : {
                     onContinuationUnavailable: () => {
                         stderr.write(`No previous ${(0, providers_1.getProvider)(provider).displayName} conversation is available. Starting a new conversation.\n`);
                     }
                 }),
+                onQueueUpdate: queueProgress.update,
                 timeoutMs: options.timeout,
                 verbose: resolveVerbose(options, program),
                 send: Boolean(options.send)
             });
-            writeProgress(stderr, options.send ? "Prompt sent; the response will remain in Chrome." : "Provider page ready in Chrome.");
+            writeProgress(stderr, options.send ? "Prompt completed." : "Provider page ready in Chrome.");
         });
     });
     const get = program.command("get").description("Print the latest assistant response from the current provider page.");
@@ -216,6 +228,36 @@ function createProgram(services = {}) {
             stdout.write(formatStatus(result, Boolean(resolveVerbose(options, program))));
         });
     });
+    const conversations = program
+        .command("conversations")
+        .description("List or forget locally named provider conversations.");
+    conversations
+        .command("list")
+        .description("List named conversations.")
+        .addOption(providerOption())
+        .option("--json", "print machine-readable JSON")
+        .action(async (options) => {
+        await runWithErrors(stderr, setExitCode, async () => {
+            const provider = options.provider ?? program.opts().provider;
+            const entries = await runner.listConversations(provider);
+            stdout.write(options.json ? formatConversationsJson(entries) : formatConversations(entries));
+        });
+    });
+    conversations
+        .command("forget <name>")
+        .description("Forget a local name without deleting the provider chat.")
+        .addOption(providerOption())
+        .action(async (name, options) => {
+        await runWithErrors(stderr, setExitCode, async () => {
+            const provider = resolveCliProvider(options, program, env);
+            const normalizedName = (0, conversations_1.normalizeConversationName)(name);
+            const removed = await runner.forgetConversation(normalizedName, provider);
+            if (!removed) {
+                throw new errors_1.CliError(`No named ${(0, providers_1.getProvider)(provider).displayName} conversation \"${normalizedName}\" was found.`);
+            }
+            stderr.write(`Forgot local ${(0, providers_1.getProvider)(provider).displayName} conversation \"${normalizedName}\". The provider chat was not deleted.\n`);
+        });
+    });
     return program;
 }
 function addCommonOptions(command, options = {}) {
@@ -237,6 +279,11 @@ function addCommonOptions(command, options = {}) {
 function providerOption() {
     return new commander_1.Option("--provider <provider>", "web chat provider: chatgpt or gemini").argParser(parseProviderOption);
 }
+function conversationOption() {
+    return new commander_1.Option("--conversation <name>", "resume a named conversation, or create it if missing")
+        .conflicts("continue")
+        .argParser(conversations_1.normalizeConversationName);
+}
 function parseProviderOption(value) {
     return (0, providers_1.parseProviderName)(value);
 }
@@ -257,8 +304,18 @@ function resolveStatusTimeout(options, program) {
     return typeof globalTimeout === "number" && globalTimeout !== config_1.DEFAULT_TIMEOUT_MS ? globalTimeout : options.timeout;
 }
 function resolveNewSession(options, program) {
+    const conversationName = resolveConversationName(options, program);
     const continuePrevious = options.continue ?? program.opts().continue;
+    if (conversationName && continuePrevious) {
+        throw new Error("--conversation cannot be used with --continue");
+    }
+    if (conversationName) {
+        return Boolean(options.new ?? program.opts().new);
+    }
     return !continuePrevious;
+}
+function resolveConversationName(options, program) {
+    return options.conversation ?? program.opts().conversation;
 }
 function collect(value, previous) {
     previous.push(value);
@@ -275,7 +332,7 @@ function writeProgress(stderr, message) {
         stderr.write(`${message}\n`);
     }
 }
-function startWaitingSpinner(stderr, providerDisplayName, newSession, env) {
+function startWaitingSpinner(stderr, providerDisplayName, newSession, env, getQueueUpdate) {
     const startedAt = Date.now();
     if (!isInteractive(stderr)) {
         return () => Date.now() - startedAt;
@@ -288,7 +345,11 @@ function startWaitingSpinner(stderr, providerDisplayName, newSession, env) {
     let frameIndex = 0;
     const render = () => {
         const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
-        stderr.write(`\r\x1b[2K${frames[frameIndex]} ${providerDisplayName} · ${newSession ? "starting new conversation" : "continuing"} · ${elapsedSeconds}s`);
+        const queue = getQueueUpdate();
+        const activity = queue?.phase === "queued"
+            ? `queued ${queue.position}/${execution_queue_1.MAX_QUEUED_EXECUTIONS}`
+            : newSession ? "starting new conversation" : "continuing";
+        stderr.write(`\r\x1b[2K${frames[frameIndex]} ${providerDisplayName} · ${activity} · ${elapsedSeconds}s`);
         frameIndex = (frameIndex + 1) % frames.length;
     };
     render();
@@ -301,6 +362,24 @@ function startWaitingSpinner(stderr, providerDisplayName, newSession, env) {
         stderr.write("\r\x1b[2K");
         return Date.now() - startedAt;
     };
+}
+function createQueueProgress(stderr, providerDisplayName) {
+    const progress = {
+        update(update) {
+            const previous = progress.current;
+            progress.current = update;
+            if (isInteractive(stderr)) {
+                return;
+            }
+            if (update.phase === "queued" && previous?.phase !== "queued") {
+                stderr.write(`${providerDisplayName} · queued ${update.position}/${execution_queue_1.MAX_QUEUED_EXECUTIONS} · waiting for an execution slot\n`);
+            }
+            else if (update.phase === "active" && previous?.phase === "queued") {
+                stderr.write(`${providerDisplayName} · execution slot acquired · starting…\n`);
+            }
+        }
+    };
+    return progress;
 }
 function writeResponseMetadata(stderr, details) {
     if (!isInteractive(stderr)) {
@@ -351,6 +430,19 @@ function formatStatus(status, verbose = false) {
     }
     lines.push(`Session: ${status.sessionOwnership}`, `Chrome debugging: ${status.connected ? "connected" : "not running"} on port ${status.port}`, `Chrome mode: ${status.connected ? (status.headless ? "headless" : "visible") : "n/a"}`, `Pages: ${status.pageCount} total, ${status.providerPageCount} ${status.providerDisplayName}`, `Current ${status.providerDisplayName} page: ${status.currentPageUrl || "none"}`, `Prompt input: ${status.promptInputVisible ? "found" : "not found"}`, `Auth: ${status.authState}`, `Ready to send: ${status.readyToSend ? "yes" : "no"}`, `Ready for headless: ${status.readyForHeadless ? "yes" : "no"}`);
     return `${lines.join("\n")}\n`;
+}
+function formatConversations(entries) {
+    if (entries.length === 0) {
+        return "No named conversations.\n";
+    }
+    const lines = ["PROVIDER\tNAME\tUPDATED\tURL"];
+    for (const entry of entries) {
+        lines.push(`${entry.provider}\t${entry.name}\t${entry.updatedAt}\t${entry.url}`);
+    }
+    return `${lines.join("\n")}\n`;
+}
+function formatConversationsJson(entries) {
+    return `${JSON.stringify(entries, null, 2)}\n`;
 }
 async function runWithErrors(stderr, setExitCode, fn) {
     try {
