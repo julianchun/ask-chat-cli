@@ -466,10 +466,22 @@ describe("provider automation", () => {
 
     await expect(
       providerRegistry.chatgpt.automation.attachFiles(page as unknown as Page, [path.join(tempDir, "missing.pdf")])
-    ).rejects.toThrow("Attachment file does not exist");
+    ).rejects.toMatchObject({
+      code: "ATTACHMENT_INVALID",
+      stage: "attachment.upload",
+      provider: "chatgpt",
+      retryable: false,
+      message: expect.stringContaining("Attachment file does not exist")
+    });
     await expect(
       providerRegistry.chatgpt.automation.attachFiles(page as unknown as Page, [tempDir])
-    ).rejects.toThrow("Attachment path is not a regular file");
+    ).rejects.toMatchObject({
+      code: "ATTACHMENT_INVALID",
+      stage: "attachment.upload",
+      provider: "chatgpt",
+      retryable: false,
+      message: expect.stringContaining("Attachment path is not a regular file")
+    });
     expect(fileInput.fileCalls).toEqual([]);
   });
 
@@ -481,13 +493,23 @@ describe("provider automation", () => {
 
     await expect(
       providerRegistry.chatgpt.automation.attachFiles(incompatiblePage as unknown as Page, [pdf])
-    ).rejects.toThrow("compatible file input or attach button for ChatGPT attachment upload");
+    ).rejects.toMatchObject({
+      code: "ATTACHMENT_UPLOAD_FAILED",
+      stage: "attachment.upload",
+      provider: "chatgpt",
+      message: expect.stringContaining("compatible file input or attach button")
+    });
 
     const rejectingPage = new FakePage();
     rejectingPage.locators.set('input[type="file"]', new FakeLocator({ setInputFilesThrows: true }));
     await expect(
       providerRegistry.chatgpt.automation.attachFiles(rejectingPage as unknown as Page, [pdf])
-    ).rejects.toThrow("ChatGPT could not attach the requested file: provider rejected file");
+    ).rejects.toMatchObject({
+      code: "ATTACHMENT_UPLOAD_FAILED",
+      stage: "attachment.upload",
+      provider: "chatgpt",
+      message: expect.stringContaining("provider rejected file")
+    });
   });
 
   it("extracts all paragraphs from a Gemini markdown response", async () => {
@@ -607,5 +629,84 @@ describe("provider automation", () => {
     });
 
     expect(result).toEqual({ text: "final answer without Gemini said label", timedOut: false });
+  });
+
+  describe.each([
+    {
+      providerName: "chatgpt",
+      provider: providerRegistry.chatgpt,
+      promptSelector: "#prompt-textarea",
+      accountSelector: '[data-testid="accounts-profile-button"]',
+      sendSelector: 'button[data-testid="send-button"]'
+    },
+    {
+      providerName: "gemini",
+      provider: providerRegistry.gemini,
+      promptSelector: 'rich-textarea [contenteditable="true"]',
+      accountSelector: 'a[aria-label*="Google Account"]',
+      sendSelector: 'button[aria-label="Send message"]'
+    }
+  ] as const)("$providerName automation contract", ({
+    providerName,
+    provider,
+    promptSelector,
+    accountSelector,
+    sendSelector
+  }) => {
+    it("detects a signed-in page and can submit a prompt", async () => {
+      const page = new FakePage(provider.homeUrl);
+      const input = new FakeLocator();
+      const send = new FakeLocator();
+      page.locators.set(promptSelector, input);
+      page.locators.set(accountSelector, new FakeLocator());
+      page.locators.set(sendSelector, send);
+
+      const inspection = await provider.automation.inspectPage(page as unknown as Page, 100);
+      const foundInput = await provider.automation.fillPrompt(page as unknown as Page, "contract prompt", 100);
+      await provider.automation.submitPrompt(page as unknown as Page, foundInput, 100);
+
+      expect(inspection).toMatchObject({
+        authState: "signed-in-likely",
+        promptInputVisible: true,
+        readyToSend: true
+      });
+      expect(input.filled).toBe("contract prompt");
+      expect(send.clicked).toBe(true);
+    });
+
+    it("returns a structured selector failure when the message box is missing", async () => {
+      const page = new FakePage(provider.homeUrl);
+
+      await expect(
+        provider.automation.fillPrompt(page as unknown as Page, "contract prompt", 1)
+      ).rejects.toMatchObject({
+        code: "PROMPT_INPUT_NOT_FOUND",
+        stage: "prompt.find",
+        provider: providerName,
+        retryable: true
+      });
+    });
+
+    it("uploads through a compatible file input", async () => {
+      const page = new FakePage(provider.homeUrl);
+      const attachment = path.join(tempDir, `${providerName}.txt`);
+      await fs.promises.writeFile(attachment, "contract", "utf8");
+      const fileInput = new FakeLocator();
+      page.locators.set('input[type="file"]', fileInput);
+
+      await provider.automation.attachFiles(page as unknown as Page, [attachment]);
+
+      expect(fileInput.files).toEqual([path.resolve(attachment)]);
+    });
+
+    it("returns a timeout result when no assistant response appears", async () => {
+      const page = new FakePage(provider.homeUrl);
+
+      const result = await provider.automation.waitForAssistantCompletion(page as unknown as Page, {
+        timeoutMs: 0
+      });
+
+      expect(result).toEqual({ text: "", timedOut: true });
+    });
   });
 });

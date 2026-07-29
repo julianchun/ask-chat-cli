@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
-import { AskApp, type BrowserStatus } from "./app";
+import { AskApp, type BrowserStatusReport, type PromptRunResult } from "./app";
 import { combinePromptAndStdin, parseTimeout, resolveOpenTarget } from "./args";
 import { DEFAULT_TIMEOUT_MS } from "./config";
 import { normalizeConversationName, type NamedConversation } from "./conversations";
 import { MAX_QUEUED_EXECUTIONS, type ExecutionQueueUpdate } from "./execution-queue";
-import { CliError } from "./errors";
+import { AskFailure, CliError } from "./errors";
 import { readStdin, writeTextOutput, type WritableLike } from "./io";
 import { getProvider, parseProviderName, resolveProviderName, type ProviderName } from "./providers";
 
@@ -36,11 +36,11 @@ export interface Runner {
     onQueueUpdate?: (update: ExecutionQueueUpdate) => void;
     timeoutMs: number;
     verbose?: boolean;
-  }): Promise<{ text: string; timedOut: boolean; conversationUrl?: string }>;
+  }): Promise<PromptRunResult>;
   get(options: { provider?: ProviderName; headless?: boolean; timeoutMs: number; verbose?: boolean }): Promise<string>;
   dump(options: { provider?: ProviderName; headless?: boolean; timeoutMs: number; verbose?: boolean }): Promise<string>;
   screenshot(output: string | undefined, options: { provider?: ProviderName; headless?: boolean; timeoutMs: number; verbose?: boolean }): Promise<string>;
-  status(options: { provider?: ProviderName; timeoutMs: number; verbose?: boolean }): Promise<BrowserStatus>;
+  status(options: { provider?: ProviderName; timeoutMs: number; verbose?: boolean }): Promise<BrowserStatusReport>;
   listConversations(provider?: ProviderName): Promise<NamedConversation[]>;
   forgetConversation(name: string, provider?: ProviderName): Promise<boolean>;
 }
@@ -132,7 +132,7 @@ export function createProgram(services: CliServices = {}): Command {
         );
         let continuationUnavailable = false;
         let elapsedMs = 0;
-        let result: { text: string; timedOut: boolean; conversationUrl?: string };
+        let result: PromptRunResult;
         try {
           result = await runner.ask({
             provider,
@@ -175,8 +175,20 @@ export function createProgram(services: CliServices = {}): Command {
         }
 
         if (result.timedOut) {
-          stderr.write(`Timed out waiting for ${getProvider(provider).displayName}; returned the latest partial response.\n`);
-          setExitCode(2);
+          const failure = result.failure || new AskFailure({
+            code: result.text ? "RESPONSE_TIMEOUT" : "RESPONSE_NOT_DETECTED",
+            stage: "response.wait",
+            provider,
+            providerDisplayName,
+            message: result.text
+              ? `Timed out waiting for ${providerDisplayName}; returned the latest partial response.`
+              : `Timed out without detecting a ${providerDisplayName} response.`,
+            retryable: true,
+            hint: `Retry with a larger \`--timeout\`, or run \`ask status --provider ${provider} --verbose\`.`,
+            exitCode: 2
+          });
+          stderr.write(formatAskFailure(failure));
+          setExitCode(failure.exitCode);
         }
       });
     });
@@ -305,15 +317,16 @@ export function createProgram(services: CliServices = {}): Command {
     });
   });
 
-  const status = program.command("status").description("Show provider readiness; use --verbose for Chrome/session details.");
+  const status = program.command("status").description("Show Chrome and provider readiness; use --verbose for technical details.");
   status
     .addOption(providerOption())
-    .option("--timeout <ms>", "prompt input detection timeout in milliseconds", parseTimeout, STATUS_TIMEOUT_MS)
+    .option("--timeout <ms>", "message-box detection timeout in milliseconds", parseTimeout, STATUS_TIMEOUT_MS)
     .option("-v, --verbose", "print browser/session details")
     .action(async (options: CommonOptions) => {
       await runWithErrors(stderr, setExitCode, async () => {
+        const provider = options.provider ?? (program.opts() as Partial<CommonOptions>).provider;
         const result = await runner.status({
-          provider: resolveCliProvider(options, program, env),
+          ...(provider ? { provider } : {}),
           timeoutMs: resolveStatusTimeout(options, program),
           verbose: resolveVerbose(options, program)
         });
@@ -554,49 +567,76 @@ function isInteractive(stderr: WritableLike): boolean {
   return Boolean((stderr as WritableLike & { isTTY?: boolean }).isTTY);
 }
 
-function statusSummary(status: BrowserStatus): string {
-  if (!status.connected || status.sessionOwnership === "absent") {
-    return "not running";
-  }
-  if (status.sessionOwnership !== "ask-managed") {
-    return "session conflict";
-  }
-  if (status.authState === "signed-in-likely" && status.readyToSend) {
-    return "ready";
-  }
-  if (status.authState === "guest" || status.authState === "login-required") {
-    return "login required";
-  }
-  if (status.authState === "blocked") {
-    return "blocked";
-  }
-  return "not ready";
-}
-
-function formatStatus(status: BrowserStatus, verbose = false): string {
+function formatStatus(report: BrowserStatusReport, verbose = false): string {
   const lines = [
-    `Status: ${statusSummary(status)}`,
-    `Provider: ${status.providerDisplayName} (${status.provider})`,
-    `Note: ${status.note}`
+    formatChromeStatus(report),
+    "",
+    formatStatusTable(report)
   ];
 
-  if (!verbose) {
-    return `${lines.join("\n")}\n`;
+  if (verbose) {
+    lines.push("", ...formatVerboseStatus(report));
   }
 
-  lines.push(
-    `Session: ${status.sessionOwnership}`,
-    `Chrome debugging: ${status.connected ? "connected" : "not running"} on port ${status.port}`,
-    `Chrome mode: ${status.connected ? (status.headless ? "headless" : "visible") : "n/a"}`,
-    `Pages: ${status.pageCount} total, ${status.providerPageCount} ${status.providerDisplayName}`,
-    `Current ${status.providerDisplayName} page: ${status.currentPageUrl || "none"}`,
-    `Prompt input: ${status.promptInputVisible ? "found" : "not found"}`,
-    `Auth: ${status.authState}`,
-    `Ready to send: ${status.readyToSend ? "yes" : "no"}`,
-    `Ready for headless: ${status.readyForHeadless ? "yes" : "no"}`
-  );
-
   return `${lines.join("\n")}\n`;
+}
+
+function formatChromeStatus(report: BrowserStatusReport): string {
+  const session = report.session;
+  if (!session.connected || session.sessionOwnership === "absent") {
+    return `Chrome: not running · port ${session.port}`;
+  }
+  if (session.sessionOwnership !== "ask-managed") {
+    return `Chrome: session conflict · ${session.sessionOwnership} · port ${session.port}`;
+  }
+  return `Chrome: running · ask-managed · ${session.headless ? "headless" : "visible"} · port ${session.port}`;
+}
+
+function formatStatusTable(report: BrowserStatusReport): string {
+  const rows = [
+    ["PROVIDER", "STATUS", "AUTH", "MESSAGE BOX"],
+    ...report.providers.map((provider) => [
+      provider.providerDisplayName,
+      provider.status.replaceAll("-", " "),
+      provider.authState,
+      provider.messageBox.replaceAll("-", " ")
+    ])
+  ];
+  const widths = rows[0].map((_, index) =>
+    Math.max(...rows.map((row) => row[index]?.length || 0))
+  );
+  return rows
+    .map((row) => row.map((value, index) => value.padEnd(widths[index])).join("  ").trimEnd())
+    .join("\n");
+}
+
+function formatVerboseStatus(report: BrowserStatusReport): string[] {
+  const session = report.session;
+  const lines = [
+    `Session: ${session.sessionOwnership}`,
+    `Chrome debugging: ${session.connected ? "connected" : "not running"} on port ${session.port}`,
+    `Chrome mode: ${session.connected ? (session.headless ? "headless" : "visible") : "n/a"}`,
+    `Browser: ${session.browser || "unknown"}`,
+    `User agent: ${session.userAgent || "unknown"}`,
+    `Pages: ${session.pageCount} total`
+  ];
+
+  for (const provider of report.providers) {
+    lines.push(
+      "",
+      `${provider.providerDisplayName} (${provider.provider}):`,
+      `  Status: ${provider.status.replaceAll("-", " ")}`,
+      `  Pages: ${provider.providerPageCount}`,
+      `  Current page: ${provider.currentPageUrl || "none"}`,
+      `  Message box: ${provider.messageBox.replaceAll("-", " ")}`,
+      `  Auth: ${provider.authState}`,
+      `  Ready to send: ${provider.readyToSend ? "yes" : "no"}`,
+      `  Ready for headless: ${provider.readyForHeadless ? "yes" : "no"}`,
+      `  Note: ${provider.note}`
+    );
+  }
+
+  return lines;
 }
 
 function formatConversations(entries: NamedConversation[]): string {
@@ -615,6 +655,31 @@ function formatConversationsJson(entries: NamedConversation[]): string {
   return `${JSON.stringify(entries, null, 2)}\n`;
 }
 
+function formatAskFailure(error: AskFailure): string {
+  const lines = [
+    `ask: ${error.providerDisplayName} failed at ${error.stage} [${error.code}]`,
+    error.message
+  ];
+  if (error.detail) {
+    lines.push(`Detail: ${error.detail}`);
+  }
+  const context: string[] = [];
+  if (error.context?.providerHost) {
+    context.push(`host=${error.context.providerHost}`);
+  }
+  if (error.context?.authState) {
+    context.push(`auth=${error.context.authState}`);
+  }
+  if (typeof error.context?.promptInputVisible === "boolean") {
+    context.push(`message-box=${error.context.promptInputVisible ? "available" : "not-found"}`);
+  }
+  if (context.length > 0) {
+    lines.push(`Context: ${context.join(" · ")}`);
+  }
+  lines.push(`Next: ${error.hint}`);
+  return `${lines.join("\n")}\n`;
+}
+
 async function runWithErrors(
   stderr: WritableLike,
   setExitCode: (code: number) => void,
@@ -623,6 +688,12 @@ async function runWithErrors(
   try {
     await fn();
   } catch (error) {
+    if (error instanceof AskFailure) {
+      stderr.write(formatAskFailure(error));
+      setExitCode(error.exitCode);
+      return;
+    }
+
     if (error instanceof CliError) {
       stderr.write(`${error.message}\n`);
       setExitCode(error.exitCode);
@@ -651,6 +722,4 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 }
-
-
 

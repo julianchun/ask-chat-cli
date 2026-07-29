@@ -10,6 +10,7 @@ exports.openWorkerPage = openWorkerPage;
 exports.selectCurrentPage = selectCurrentPage;
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
+const errors_1 = require("./errors");
 function createProviderAutomation(config) {
     return {
         inspectPage: (page, timeoutMs) => inspectProviderPage(page, config, timeoutMs),
@@ -116,7 +117,7 @@ async function findPromptInput(page, provider, timeoutMs = 30_000) {
             await page.waitForTimeout(Math.min(100, remainingMs));
         }
     }
-    throw new Error(`Could not find a visible ${provider.displayName} prompt input within ${timeoutMs}ms.`);
+    throw providerFailure(provider, "PROMPT_INPUT_NOT_FOUND", "prompt.find", `Could not find a visible ${provider.displayName} message box within ${timeoutMs}ms.`, `Run \`ask status --provider ${provider.name} --verbose\`.`, true);
 }
 async function hasPromptInput(page, provider, timeoutMs = 3_000) {
     const startedAt = Date.now();
@@ -238,10 +239,10 @@ async function attachFiles(page, provider, filePaths) {
     const resolvedPaths = filePaths.map((filePath) => node_path_1.default.resolve(filePath));
     for (const filePath of resolvedPaths) {
         if (!node_fs_1.default.existsSync(filePath)) {
-            throw new Error(`Attachment file does not exist: ${filePath}`);
+            throw providerFailure(provider, "ATTACHMENT_INVALID", "attachment.upload", `Attachment file does not exist: ${filePath}`, "Check the attachment path, then try again.", false);
         }
         if (!node_fs_1.default.statSync(filePath).isFile()) {
-            throw new Error(`Attachment path is not a regular file: ${filePath}`);
+            throw providerFailure(provider, "ATTACHMENT_INVALID", "attachment.upload", `Attachment path is not a regular file: ${filePath}`, "Choose a regular file instead of a directory, then try again.", false);
         }
     }
     const fileInputs = page.locator(provider.fileInputSelectors.join(", "));
@@ -266,7 +267,7 @@ async function attachFiles(page, provider, filePaths) {
     }
     const attachButton = page.locator(provider.attachButtonSelectors.join(", ")).last();
     if ((await attachButton.count()) === 0) {
-        throw new Error(`Could not find a compatible file input or attach button for ${provider.displayName} attachment upload.`);
+        throw providerFailure(provider, "ATTACHMENT_UPLOAD_FAILED", "attachment.upload", `Could not find a compatible file input or attach button for ${provider.displayName} attachment upload.`, `Run \`ask status --provider ${provider.name} --verbose\`.`, true);
     }
     try {
         const fileChooser = await openFileChooser(page, attachButton);
@@ -342,8 +343,11 @@ async function openFileChooser(page, attachButton) {
     return fileChooser;
 }
 function attachmentUploadError(provider, error) {
+    if (error instanceof errors_1.AskFailure) {
+        return error;
+    }
     const detail = error instanceof Error ? error.message : String(error);
-    return new Error(`${provider.displayName} could not attach the requested file${detail ? `: ${detail}` : "."}`);
+    return providerFailure(provider, "ATTACHMENT_UPLOAD_FAILED", "attachment.upload", `${provider.displayName} could not attach the requested file${detail ? `: ${detail}` : "."}`, "Check that the file type is supported and try again.", true, error);
 }
 async function fillPrompt(page, provider, prompt, timeoutMs = 30_000) {
     const input = await findPromptInput(page, provider, timeoutMs);
@@ -382,13 +386,25 @@ async function submitPrompt(page, provider, input, timeoutMs = 30_000) {
         await page.waitForTimeout(250);
     } while (Date.now() - startedAt < timeoutMs);
     if (Date.now() - startedAt >= timeoutMs) {
-        throw new Error(`${provider.displayName} send button remained disabled while attachments were processing.`);
+        throw providerFailure(provider, "PROMPT_SUBMIT_FAILED", "prompt.submit", `${provider.displayName} send button remained disabled while attachments were processing.`, "Wait for attachments to finish processing, then try again.", true);
     }
     if (input) {
         await input.press("Enter");
         return;
     }
     await page.keyboard.press("Enter");
+}
+function providerFailure(provider, code, stage, message, hint, retryable, cause) {
+    return new errors_1.AskFailure({
+        code,
+        stage,
+        provider: provider.name,
+        providerDisplayName: provider.displayName,
+        message,
+        retryable,
+        hint,
+        cause
+    });
 }
 async function extractLatestAssistantText(page, provider) {
     return page.evaluate(({ responseSelectors, contentSelectors }) => {

@@ -97,8 +97,20 @@ function createProgram(services = {}) {
                 }
             }
             if (result.timedOut) {
-                stderr.write(`Timed out waiting for ${(0, providers_1.getProvider)(provider).displayName}; returned the latest partial response.\n`);
-                setExitCode(2);
+                const failure = result.failure || new errors_1.AskFailure({
+                    code: result.text ? "RESPONSE_TIMEOUT" : "RESPONSE_NOT_DETECTED",
+                    stage: "response.wait",
+                    provider,
+                    providerDisplayName,
+                    message: result.text
+                        ? `Timed out waiting for ${providerDisplayName}; returned the latest partial response.`
+                        : `Timed out without detecting a ${providerDisplayName} response.`,
+                    retryable: true,
+                    hint: `Retry with a larger \`--timeout\`, or run \`ask status --provider ${provider} --verbose\`.`,
+                    exitCode: 2
+                });
+                stderr.write(formatAskFailure(failure));
+                setExitCode(failure.exitCode);
             }
         });
     });
@@ -213,15 +225,16 @@ function createProgram(services = {}) {
             }
         });
     });
-    const status = program.command("status").description("Show provider readiness; use --verbose for Chrome/session details.");
+    const status = program.command("status").description("Show Chrome and provider readiness; use --verbose for technical details.");
     status
         .addOption(providerOption())
-        .option("--timeout <ms>", "prompt input detection timeout in milliseconds", args_1.parseTimeout, STATUS_TIMEOUT_MS)
+        .option("--timeout <ms>", "message-box detection timeout in milliseconds", args_1.parseTimeout, STATUS_TIMEOUT_MS)
         .option("-v, --verbose", "print browser/session details")
         .action(async (options) => {
         await runWithErrors(stderr, setExitCode, async () => {
+            const provider = options.provider ?? program.opts().provider;
             const result = await runner.status({
-                provider: resolveCliProvider(options, program, env),
+                ...(provider ? { provider } : {}),
                 timeoutMs: resolveStatusTimeout(options, program),
                 verbose: resolveVerbose(options, program)
             });
@@ -401,35 +414,56 @@ function formatElapsed(elapsedMs) {
 function isInteractive(stderr) {
     return Boolean(stderr.isTTY);
 }
-function statusSummary(status) {
-    if (!status.connected || status.sessionOwnership === "absent") {
-        return "not running";
-    }
-    if (status.sessionOwnership !== "ask-managed") {
-        return "session conflict";
-    }
-    if (status.authState === "signed-in-likely" && status.readyToSend) {
-        return "ready";
-    }
-    if (status.authState === "guest" || status.authState === "login-required") {
-        return "login required";
-    }
-    if (status.authState === "blocked") {
-        return "blocked";
-    }
-    return "not ready";
-}
-function formatStatus(status, verbose = false) {
+function formatStatus(report, verbose = false) {
     const lines = [
-        `Status: ${statusSummary(status)}`,
-        `Provider: ${status.providerDisplayName} (${status.provider})`,
-        `Note: ${status.note}`
+        formatChromeStatus(report),
+        "",
+        formatStatusTable(report)
     ];
-    if (!verbose) {
-        return `${lines.join("\n")}\n`;
+    if (verbose) {
+        lines.push("", ...formatVerboseStatus(report));
     }
-    lines.push(`Session: ${status.sessionOwnership}`, `Chrome debugging: ${status.connected ? "connected" : "not running"} on port ${status.port}`, `Chrome mode: ${status.connected ? (status.headless ? "headless" : "visible") : "n/a"}`, `Pages: ${status.pageCount} total, ${status.providerPageCount} ${status.providerDisplayName}`, `Current ${status.providerDisplayName} page: ${status.currentPageUrl || "none"}`, `Prompt input: ${status.promptInputVisible ? "found" : "not found"}`, `Auth: ${status.authState}`, `Ready to send: ${status.readyToSend ? "yes" : "no"}`, `Ready for headless: ${status.readyForHeadless ? "yes" : "no"}`);
     return `${lines.join("\n")}\n`;
+}
+function formatChromeStatus(report) {
+    const session = report.session;
+    if (!session.connected || session.sessionOwnership === "absent") {
+        return `Chrome: not running · port ${session.port}`;
+    }
+    if (session.sessionOwnership !== "ask-managed") {
+        return `Chrome: session conflict · ${session.sessionOwnership} · port ${session.port}`;
+    }
+    return `Chrome: running · ask-managed · ${session.headless ? "headless" : "visible"} · port ${session.port}`;
+}
+function formatStatusTable(report) {
+    const rows = [
+        ["PROVIDER", "STATUS", "AUTH", "MESSAGE BOX"],
+        ...report.providers.map((provider) => [
+            provider.providerDisplayName,
+            provider.status.replaceAll("-", " "),
+            provider.authState,
+            provider.messageBox.replaceAll("-", " ")
+        ])
+    ];
+    const widths = rows[0].map((_, index) => Math.max(...rows.map((row) => row[index]?.length || 0)));
+    return rows
+        .map((row) => row.map((value, index) => value.padEnd(widths[index])).join("  ").trimEnd())
+        .join("\n");
+}
+function formatVerboseStatus(report) {
+    const session = report.session;
+    const lines = [
+        `Session: ${session.sessionOwnership}`,
+        `Chrome debugging: ${session.connected ? "connected" : "not running"} on port ${session.port}`,
+        `Chrome mode: ${session.connected ? (session.headless ? "headless" : "visible") : "n/a"}`,
+        `Browser: ${session.browser || "unknown"}`,
+        `User agent: ${session.userAgent || "unknown"}`,
+        `Pages: ${session.pageCount} total`
+    ];
+    for (const provider of report.providers) {
+        lines.push("", `${provider.providerDisplayName} (${provider.provider}):`, `  Status: ${provider.status.replaceAll("-", " ")}`, `  Pages: ${provider.providerPageCount}`, `  Current page: ${provider.currentPageUrl || "none"}`, `  Message box: ${provider.messageBox.replaceAll("-", " ")}`, `  Auth: ${provider.authState}`, `  Ready to send: ${provider.readyToSend ? "yes" : "no"}`, `  Ready for headless: ${provider.readyForHeadless ? "yes" : "no"}`, `  Note: ${provider.note}`);
+    }
+    return lines;
 }
 function formatConversations(entries) {
     if (entries.length === 0) {
@@ -444,11 +478,40 @@ function formatConversations(entries) {
 function formatConversationsJson(entries) {
     return `${JSON.stringify(entries, null, 2)}\n`;
 }
+function formatAskFailure(error) {
+    const lines = [
+        `ask: ${error.providerDisplayName} failed at ${error.stage} [${error.code}]`,
+        error.message
+    ];
+    if (error.detail) {
+        lines.push(`Detail: ${error.detail}`);
+    }
+    const context = [];
+    if (error.context?.providerHost) {
+        context.push(`host=${error.context.providerHost}`);
+    }
+    if (error.context?.authState) {
+        context.push(`auth=${error.context.authState}`);
+    }
+    if (typeof error.context?.promptInputVisible === "boolean") {
+        context.push(`message-box=${error.context.promptInputVisible ? "available" : "not-found"}`);
+    }
+    if (context.length > 0) {
+        lines.push(`Context: ${context.join(" · ")}`);
+    }
+    lines.push(`Next: ${error.hint}`);
+    return `${lines.join("\n")}\n`;
+}
 async function runWithErrors(stderr, setExitCode, fn) {
     try {
         await fn();
     }
     catch (error) {
+        if (error instanceof errors_1.AskFailure) {
+            stderr.write(formatAskFailure(error));
+            setExitCode(error.exitCode);
+            return;
+        }
         if (error instanceof errors_1.CliError) {
             stderr.write(`${error.message}\n`);
             setExitCode(error.exitCode);

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createProgram, type Runner } from "../src/cli";
+import { AskFailure } from "../src/errors";
 
 class BufferWriter {
   text = "";
@@ -34,21 +35,44 @@ function makeRunner(): Runner {
     dump: vi.fn(async () => "<html></html>"),
     screenshot: vi.fn(async () => "C:\\Users\\Me\\.ask\\screenshots\\shot.png"),
     status: vi.fn(async () => ({
-      provider: "chatgpt" as const,
-      providerDisplayName: "ChatGPT",
-      port: 9222,
-      connected: true,
-      sessionOwnership: "ask-managed" as const,
-      headless: false,
-      pageCount: 1,
-      providerPageCount: 1,
-      currentPageUrl: "https://chatgpt.com/",
-      promptInputVisible: true,
-      authState: "signed-in-likely" as const,
-      readyToSend: true,
-      readyForHeadless: true,
-      loggedInLikely: true,
-      note: "ChatGPT appears signed in and ready in the visible ask Chrome session."
+      session: {
+        port: 9222,
+        connected: true,
+        sessionOwnership: "ask-managed" as const,
+        headless: false,
+        browser: "Chrome/149.0.0.0",
+        userAgent: "Mozilla/5.0 Chrome/149.0.0.0 Safari/537.36",
+        pageCount: 1
+      },
+      providers: [
+        {
+          provider: "chatgpt" as const,
+          providerDisplayName: "ChatGPT",
+          status: "ready" as const,
+          providerPageCount: 1,
+          currentPageUrl: "https://chatgpt.com/",
+          messageBox: "available" as const,
+          promptInputVisible: true,
+          authState: "signed-in-likely" as const,
+          readyToSend: true,
+          readyForHeadless: true,
+          loggedInLikely: true,
+          note: "ChatGPT appears signed in and ready in the visible ask Chrome session."
+        },
+        {
+          provider: "gemini" as const,
+          providerDisplayName: "Gemini",
+          status: "not-open" as const,
+          providerPageCount: 0,
+          messageBox: "not-checked" as const,
+          promptInputVisible: false,
+          authState: "unknown" as const,
+          readyToSend: false,
+          readyForHeadless: false,
+          loggedInLikely: false,
+          note: "No Gemini page is open in the ask-managed Chrome session."
+        }
+      ]
     })),
     listConversations: vi.fn(async () => []),
     forgetConversation: vi.fn(async () => true)
@@ -397,8 +421,51 @@ describe("cli", () => {
     await program.parseAsync(["node", "ask", "prompt"]);
 
     expect(stdout.text).toBe("partial\n");
+    expect(stderr.text).toContain("ask: ChatGPT failed at response.wait [RESPONSE_TIMEOUT]");
     expect(stderr.text).toContain("Timed out waiting for ChatGPT");
+    expect(stderr.text).toContain("Next:");
     expect(exitCode).toBe(2);
+  });
+
+  it("prints structured provider failures with safe context and remediation", async () => {
+    const runner = makeRunner();
+    vi.mocked(runner.ask).mockRejectedValue(new AskFailure({
+      code: "PROMPT_INPUT_NOT_FOUND",
+      stage: "prompt.find",
+      provider: "gemini",
+      providerDisplayName: "Gemini",
+      message: "Could not find a visible Gemini message box.",
+      retryable: true,
+      hint: "Run `ask status --provider gemini --verbose`.",
+      detail: "No configured editor selector matched.",
+      context: {
+        providerHost: "gemini.google.com",
+        authState: "signed-in-likely",
+        promptInputVisible: false
+      }
+    }));
+    const stdout = new BufferWriter();
+    const stderr = new BufferWriter();
+    let exitCode = 0;
+    const program = makeProgram(runner, {
+      stdout,
+      stderr,
+      setExitCode: (code) => {
+        exitCode = code;
+      }
+    });
+
+    await program.parseAsync(["node", "ask", "--provider", "gemini", "prompt"]);
+
+    expect(stdout.text).toBe("");
+    expect(stderr.text).toBe(
+      "ask: Gemini failed at prompt.find [PROMPT_INPUT_NOT_FOUND]\n" +
+      "Could not find a visible Gemini message box.\n" +
+      "Detail: No configured editor selector matched.\n" +
+      "Context: host=gemini.google.com · auth=signed-in-likely · message-box=not-found\n" +
+      "Next: Run `ask status --provider gemini --verbose`.\n"
+    );
+    expect(exitCode).toBe(1);
   });
 
   it("routes a top-level Gemini prompt", async () => {
@@ -681,7 +748,7 @@ describe("cli", () => {
     }
   });
 
-  it("prints provider status", async () => {
+  it("prints every provider status by default", async () => {
     const runner = makeRunner();
     const stdout = new BufferWriter();
     const program = makeProgram(runner, { stdout });
@@ -689,46 +756,55 @@ describe("cli", () => {
     await program.parseAsync(["node", "ask", "status"]);
 
     expect(runner.status).toHaveBeenCalledWith({
-      provider: "chatgpt" as const,
       timeoutMs: 3000,
       verbose: undefined
     });
-    expect(stdout.text).toContain("Status: ready");
-    expect(stdout.text).toContain("Provider: ChatGPT (chatgpt)");
-    expect(stdout.text).toContain("Note:");
-    expect(stdout.text).not.toContain("Chrome mode: visible");
+    expect(stdout.text).toContain("Chrome: running · ask-managed · visible · port 9222");
+    expect(stdout.text).toContain("PROVIDER  STATUS    AUTH              MESSAGE BOX");
+    expect(stdout.text).toContain("ChatGPT   ready     signed-in-likely  available");
+    expect(stdout.text).toContain("Gemini    not open  unknown           not checked");
+    expect(stdout.text).not.toContain("Message box:");
   });
 
-  it("prints technical provider status with --verbose", async () => {
+  it("prints technical provider details and message-box status with --verbose", async () => {
     const runner = makeRunner();
     const stdout = new BufferWriter();
     const program = makeProgram(runner, { stdout });
 
     await program.parseAsync(["node", "ask", "status", "--verbose"]);
 
-    expect(stdout.text).toContain("Status: ready");
     expect(stdout.text).toContain("Chrome mode: visible");
     expect(stdout.text).toContain("Session: ask-managed");
-    expect(stdout.text).toContain("Auth: signed-in-likely");
-    expect(stdout.text).toContain("Ready for headless: yes");
+    expect(stdout.text).toContain("ChatGPT (chatgpt):");
+    expect(stdout.text).toContain("Message box: available");
+    expect(stdout.text).toContain("Gemini (gemini):");
+    expect(stdout.text).toContain("Message box: not checked");
   });
 
-  it("leads guest status with login required", async () => {
+  it("shows a guest provider as login required", async () => {
     const runner = makeRunner();
+    const report = await runner.status({ timeoutMs: 3000 });
     vi.mocked(runner.status).mockResolvedValue({
-      ...await runner.status({ timeoutMs: 3000 }),
-      authState: "guest",
-      readyToSend: true,
-      readyForHeadless: false,
-      loggedInLikely: false,
-      note: "ChatGPT is ready to send, but it appears signed out."
+      ...report,
+      providers: report.providers.map((provider) =>
+        provider.provider === "chatgpt"
+          ? {
+              ...provider,
+              status: "login-required" as const,
+              authState: "guest" as const,
+              readyForHeadless: false,
+              loggedInLikely: false,
+              note: "ChatGPT is ready to send, but it appears signed out."
+            }
+          : provider
+      )
     });
     const stdout = new BufferWriter();
     const program = makeProgram(runner, { stdout });
 
     await program.parseAsync(["node", "ask", "status"]);
 
-    expect(stdout.text.startsWith("Status: login required\n")).toBe(true);
+    expect(stdout.text).toContain("ChatGPT   login required  guest");
   });
 
   it("routes command-local provider for status", async () => {
@@ -740,6 +816,20 @@ describe("cli", () => {
     expect(runner.status).toHaveBeenCalledWith({
       provider: "gemini",
       timeoutMs: 1000,
+      verbose: undefined
+    });
+  });
+
+  it("ignores ASK_PROVIDER when status has no explicit provider filter", async () => {
+    const runner = makeRunner();
+    const program = makeProgram(runner, {
+      env: { ASK_PROVIDER: "gemini" } as NodeJS.ProcessEnv
+    });
+
+    await program.parseAsync(["node", "ask", "status"]);
+
+    expect(runner.status).toHaveBeenCalledWith({
+      timeoutMs: 3000,
       verbose: undefined
     });
   });
@@ -838,6 +928,4 @@ describe("cli", () => {
     expect(runner.ask).not.toHaveBeenCalled();
   });
 });
-
-
 

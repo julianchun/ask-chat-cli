@@ -47,6 +47,7 @@ vi.mock("../src/execution-queue", () => ({
 }));
 
 vi.mock("../src/browser", () => {
+  class ChromeSessionConflictError extends Error {}
   const connectToChrome = vi.fn(async () => state.browser);
   const inspectChromeSession = vi.fn(async () => ({
     port: 9222,
@@ -58,6 +59,7 @@ vi.mock("../src/browser", () => {
   }));
   const waitForRemoteDebugging = vi.fn();
   return {
+    ChromeSessionConflictError,
     connectToChrome,
     createChromeSessionController: vi.fn(() => ({
       connect: connectToChrome,
@@ -168,7 +170,8 @@ vi.mock("../src/webchat", () => {
   };
 });
 
-import { connectToChrome, inspectChromeSession } from "../src/browser";
+import { ChromeSessionConflictError, connectToChrome, inspectChromeSession } from "../src/browser";
+import { AskFailure } from "../src/errors";
 import { providerRegistry } from "../src/providers";
 import { openChatPage, openWorkerPage } from "../src/webchat";
 import { AskApp } from "../src/app";
@@ -303,16 +306,21 @@ describe("AskApp", () => {
     const env = {} as NodeJS.ProcessEnv;
     const app = new AskApp({ env });
 
-    const status = await app.status({ provider: "gemini", timeoutMs: 1000 });
+    const report = await app.status({ provider: "gemini", timeoutMs: 1000 });
 
-    expect(status).toMatchObject({
-      provider: "gemini",
-      providerDisplayName: "Gemini",
+    expect(report.session).toMatchObject({
       port: 9222,
       connected: false,
       sessionOwnership: "absent",
-      pageCount: 0,
+      pageCount: 0
+    });
+    expect(report.providers).toHaveLength(1);
+    expect(report.providers[0]).toMatchObject({
+      provider: "gemini",
+      providerDisplayName: "Gemini",
+      status: "not-running",
       providerPageCount: 0,
+      messageBox: "not-checked",
       promptInputVisible: false,
       authState: "unknown",
       readyToSend: false,
@@ -335,7 +343,8 @@ describe("AskApp", () => {
     const env = {} as NodeJS.ProcessEnv;
     const app = new AskApp({ env });
 
-    const status = await app.status({ provider: "gemini", timeoutMs: 1000 });
+    const report = await app.status({ provider: "gemini", timeoutMs: 1000 });
+    const status = report.providers[0];
 
     expect(connectToChrome).toHaveBeenCalledWith({
       headless: undefined,
@@ -346,19 +355,127 @@ describe("AskApp", () => {
     expect(status).toMatchObject({
       provider: "gemini",
       providerDisplayName: "Gemini",
-      connected: true,
-      sessionOwnership: "ask-managed",
-      headless: true,
-      pageCount: 1,
+      status: "ready",
       providerPageCount: 1,
       currentPageUrl: "https://gemini.google.com/app",
+      messageBox: "available",
       promptInputVisible: true,
       authState: "signed-in-likely",
       readyToSend: true,
       readyForHeadless: true,
       loggedInLikely: true
     });
-    expect(status.note).toContain("Chrome is headless");
+    expect(status?.note).toContain("Chrome is headless");
+    expect(report.session).toMatchObject({
+      connected: true,
+      sessionOwnership: "ask-managed",
+      headless: true,
+      pageCount: 1
+    });
+  });
+
+  it("inspects all open providers in registry order with one browser connection", async () => {
+    const geminiPage = {
+      ...state.page,
+      url: vi.fn(() => "https://gemini.google.com/app")
+    };
+    state.browser.contexts.mockImplementation(() => [
+      {
+        pages: () => [state.page, geminiPage]
+      }
+    ]);
+    vi.mocked(inspectProviderPage)
+      .mockResolvedValueOnce({
+        promptInputVisible: true,
+        authState: "signed-in-likely",
+        readyToSend: true,
+        readyForHeadless: true
+      })
+      .mockResolvedValueOnce({
+        promptInputVisible: true,
+        authState: "guest",
+        readyToSend: true,
+        readyForHeadless: false
+      });
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    const report = await app.status({ timeoutMs: 1000 });
+
+    expect(inspectChromeSession).toHaveBeenCalledOnce();
+    expect(connectToChrome).toHaveBeenCalledOnce();
+    expect(inspectProviderPage).toHaveBeenCalledTimes(2);
+    expect(report.session.pageCount).toBe(2);
+    expect(report.providers.map((provider) => provider.provider)).toEqual(["chatgpt", "gemini"]);
+    expect(report.providers).toMatchObject([
+      { status: "ready", messageBox: "available" },
+      { status: "login-required", authState: "guest", messageBox: "available" }
+    ]);
+  });
+
+  it("reports providers without an open page without navigating", async () => {
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    const report = await app.status({ timeoutMs: 1000 });
+
+    expect(openChatPage).not.toHaveBeenCalled();
+    expect(openWorkerPage).not.toHaveBeenCalled();
+    expect(report.providers).toMatchObject([
+      { provider: "chatgpt", status: "ready", messageBox: "available" },
+      { provider: "gemini", status: "not-open", messageBox: "not-checked" }
+    ]);
+  });
+
+  it("classifies browser connection failures before opening a worker page", async () => {
+    vi.mocked(connectToChrome).mockRejectedValueOnce(new Error("CDP unavailable"));
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toMatchObject({
+      code: "BROWSER_UNAVAILABLE",
+      stage: "browser.connect",
+      provider: "chatgpt",
+      detail: "CDP unavailable",
+      context: {
+        providerHost: "chatgpt.com"
+      }
+    });
+    expect(openWorkerPage).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a conflicting Chrome session from an unavailable browser", async () => {
+    vi.mocked(connectToChrome).mockRejectedValueOnce(new ChromeSessionConflictError("external session"));
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toMatchObject({
+      code: "SESSION_CONFLICT",
+      stage: "browser.connect",
+      provider: "chatgpt",
+      retryable: false,
+      detail: "external session",
+      hint: expect.stringContaining("ASK_REMOTE_DEBUGGING_PORT")
+    });
+  });
+
+  it("classifies execution queue failures without attempting browser work", async () => {
+    const queue: ExecutionQueue = {
+      acquire: vi.fn(async () => {
+        throw new Error("queue unavailable token=private-value");
+      }),
+      acquireBrowserLease: vi.fn(),
+      acquireConversationLease: vi.fn(),
+      inspect: vi.fn(async () => ({ active: 4, queued: 4 })),
+      assertNoActive: vi.fn(async () => undefined),
+      assertConversationIdle: vi.fn(async () => undefined)
+    };
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv, executionQueue: queue });
+
+    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toMatchObject({
+      code: "QUEUE_UNAVAILABLE",
+      stage: "queue.acquire",
+      provider: "chatgpt",
+      retryable: true,
+      detail: "queue unavailable token=[redacted]"
+    });
+    expect(connectToChrome).not.toHaveBeenCalled();
   });
 
   it("does not inspect external sessions in status", async () => {
@@ -371,12 +488,15 @@ describe("AskApp", () => {
     });
     const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
 
-    const status = await app.status({ provider: "chatgpt", timeoutMs: 1000 });
+    const report = await app.status({ provider: "chatgpt", timeoutMs: 1000 });
 
-    expect(status).toMatchObject({
+    expect(report.session).toMatchObject({
       connected: true,
       sessionOwnership: "external",
-      pageCount: 0,
+      pageCount: 0
+    });
+    expect(report.providers[0]).toMatchObject({
+      status: "session-conflict",
       providerPageCount: 0,
       authState: "unknown"
     });
@@ -395,6 +515,7 @@ describe("AskApp", () => {
     await expect(app.ask({ prompt: "hi", attachments: [], headless: true, timeoutMs: 1000 })).rejects.toThrow("not ready for headless");
   });
   it("rejects visible prompts when the provider is a guest session", async () => {
+    state.page.url.mockImplementation(() => "https://gemini.google.com/app");
     vi.mocked(inspectProviderPage).mockResolvedValue({
       promptInputVisible: true,
       authState: "guest",
@@ -403,9 +524,17 @@ describe("AskApp", () => {
     });
     const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
 
-    await expect(app.ask({ provider: "gemini", prompt: "hi", attachments: ["shot.png"], timeoutMs: 1000 })).rejects.toThrow(
-      "Gemini is not ready to send from a signed-in session (auth: guest, prompt: found)."
-    );
+    await expect(app.ask({ provider: "gemini", prompt: "hi", attachments: ["shot.png"], timeoutMs: 1000 })).rejects.toMatchObject({
+      code: "AUTH_REQUIRED",
+      stage: "auth.inspect",
+      provider: "gemini",
+      message: expect.stringContaining("auth: guest"),
+      context: {
+        providerHost: "gemini.google.com",
+        authState: "guest",
+        promptInputVisible: true
+      }
+    });
     await expect(app.ask({ provider: "gemini", prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toThrow(
       "ask login --provider gemini"
     );
@@ -442,6 +571,97 @@ describe("AskApp", () => {
     expect(state.page.close).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    {
+      name: "attachment upload",
+      mock: attachFiles,
+      code: "ATTACHMENT_UPLOAD_FAILED",
+      stage: "attachment.upload"
+    },
+    {
+      name: "message-box discovery",
+      mock: fillPrompt,
+      code: "PROMPT_INPUT_NOT_FOUND",
+      stage: "prompt.find"
+    },
+    {
+      name: "prompt submission",
+      mock: submitPrompt,
+      code: "PROMPT_SUBMIT_FAILED",
+      stage: "prompt.submit"
+    }
+  ] as const)("classifies $name failures and still closes the worker page", async ({ mock, code, stage }) => {
+    vi.mocked(mock).mockRejectedValueOnce(new Error("provider UI changed"));
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    await expect(app.ask({ prompt: "hi", attachments: ["shot.png"], timeoutMs: 1000 })).rejects.toMatchObject({
+      code,
+      stage,
+      provider: "chatgpt",
+      context: {
+        providerHost: "chatgpt.com"
+      },
+      hint: expect.any(String)
+    });
+
+    expect(state.page.close).toHaveBeenCalledOnce();
+    expect(state.browser.close).toHaveBeenCalledOnce();
+  });
+
+  it("classifies a missing message box separately from authentication", async () => {
+    vi.mocked(inspectProviderPage).mockResolvedValue({
+      promptInputVisible: false,
+      authState: "signed-in-likely",
+      readyToSend: false,
+      readyForHeadless: false
+    });
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    const report = await app.status({ provider: "chatgpt", timeoutMs: 1000 });
+    expect(report.providers[0]).toMatchObject({
+      status: "not-ready",
+      messageBox: "not-found",
+      note: expect.stringContaining("message box was not found")
+    });
+
+    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toMatchObject({
+      code: "PROMPT_INPUT_NOT_FOUND",
+      stage: "prompt.find",
+      provider: "chatgpt",
+      message: expect.stringContaining("message box was not found"),
+      hint: expect.stringContaining("provider UI may have changed"),
+      context: {
+        providerHost: "chatgpt.com",
+        authState: "signed-in-likely",
+        promptInputVisible: false
+      }
+    });
+    expect(fillPrompt).not.toHaveBeenCalled();
+    expect(submitPrompt).not.toHaveBeenCalled();
+  });
+
+  it("adds application context to provider-originated structured failures", async () => {
+    vi.mocked(fillPrompt).mockRejectedValueOnce(new AskFailure({
+      code: "PROMPT_INPUT_NOT_FOUND",
+      stage: "prompt.find",
+      provider: "chatgpt",
+      providerDisplayName: "ChatGPT",
+      message: "Could not find a visible ChatGPT message box.",
+      retryable: true,
+      hint: "Inspect the provider page."
+    }));
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toMatchObject({
+      code: "PROMPT_INPUT_NOT_FOUND",
+      stage: "prompt.find",
+      context: {
+        providerHost: "chatgpt.com",
+        promptInputVisible: false
+      }
+    });
+  });
+
   it("allows scheduled executions to coordinate a shared Chrome mode change", async () => {
     const release = vi.fn(async () => undefined);
     const queue: ExecutionQueue = {
@@ -463,7 +683,11 @@ describe("AskApp", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  it.each(["login-required", "blocked", "unknown"] as const)("rejects visible prompts when provider auth is %s", async (authState) => {
+  it.each([
+    ["login-required", "AUTH_REQUIRED"],
+    ["blocked", "PROVIDER_BLOCKED"],
+    ["unknown", "AUTH_UNCONFIRMED"]
+  ] as const)("rejects visible prompts when provider auth is %s", async (authState, code) => {
     vi.mocked(inspectProviderPage).mockResolvedValue({
       promptInputVisible: authState !== "login-required",
       authState,
@@ -472,12 +696,23 @@ describe("AskApp", () => {
     });
     const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
 
-    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toThrow(`auth: ${authState}`);
+    await expect(app.ask({ prompt: "hi", attachments: [], timeoutMs: 1000 })).rejects.toMatchObject({
+      code,
+      stage: "auth.inspect",
+      provider: "chatgpt",
+      hint: expect.stringContaining(authState === "blocked" ? "verification" : "ask login"),
+      context: {
+        providerHost: "chatgpt.com",
+        authState,
+        promptInputVisible: authState !== "login-required"
+      }
+    });
     expect(fillPrompt).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
   });
 
   it("requires signed-in auth before open --send mutates the page", async () => {
+    state.page.url.mockImplementation(() => "https://gemini.google.com/app");
     vi.mocked(inspectProviderPage).mockResolvedValue({
       promptInputVisible: true,
       authState: "guest",
@@ -486,7 +721,16 @@ describe("AskApp", () => {
     });
     const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
 
-    await expect(app.open({ url: "https://gemini.google.com/app", provider: "gemini", prompt: "hi", attachments: ["shot.png"], send: true, timeoutMs: 1000 })).rejects.toThrow("auth: guest");
+    await expect(app.open({ url: "https://gemini.google.com/app", provider: "gemini", prompt: "hi", attachments: ["shot.png"], send: true, timeoutMs: 1000 })).rejects.toMatchObject({
+      code: "AUTH_REQUIRED",
+      stage: "auth.inspect",
+      provider: "gemini",
+      context: {
+        providerHost: "gemini.google.com",
+        authState: "guest",
+        promptInputVisible: true
+      }
+    });
     expect(attachFiles).not.toHaveBeenCalled();
     expect(fillPrompt).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
@@ -591,10 +835,45 @@ describe("AskApp", () => {
     await vi.waitFor(() => expect(state.resolveWait).toBeDefined());
     state.resolveWait?.({ text: "partial answer", timedOut: true });
 
-    await expect(resultPromise).resolves.toEqual({ text: "partial answer", timedOut: true });
+    await expect(resultPromise).resolves.toMatchObject({
+      text: "partial answer",
+      timedOut: true,
+      failure: {
+        code: "RESPONSE_TIMEOUT",
+        stage: "response.wait",
+        provider: "chatgpt",
+        exitCode: 2,
+        context: {
+          providerHost: "chatgpt.com"
+        }
+      }
+    });
     expect(stopAssistantGeneration).toHaveBeenCalledWith(state.page);
     expect(state.rememberConversation).not.toHaveBeenCalled();
     expect(state.page.close).toHaveBeenCalledOnce();
+  });
+
+  it("distinguishes a timeout with no detected response", async () => {
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    const resultPromise = app.ask({
+      prompt: "hi",
+      attachments: [],
+      timeoutMs: 1000
+    });
+    await vi.waitFor(() => expect(state.resolveWait).toBeDefined());
+    state.resolveWait?.({ text: "", timedOut: true });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      text: "",
+      timedOut: true,
+      failure: {
+        code: "RESPONSE_NOT_DETECTED",
+        stage: "response.wait",
+        exitCode: 2
+      }
+    });
+    expect(stopAssistantGeneration).toHaveBeenCalledWith(state.page);
   });
 
   it("binds a named conversation after receiving a valid conversation URL", async () => {
@@ -618,6 +897,30 @@ describe("AskApp", () => {
       state.page,
       "release-notes"
     );
+  });
+
+  it("classifies conversation persistence failures after receiving a response", async () => {
+    state.rememberConversation.mockRejectedValueOnce(new Error("local state unavailable"));
+    const app = new AskApp({ env: {} as NodeJS.ProcessEnv });
+
+    const resultPromise = app.ask({
+      prompt: "hi",
+      attachments: [],
+      conversationName: "release-notes",
+      timeoutMs: 1000
+    });
+    await vi.waitFor(() => expect(state.resolveWait).toBeDefined());
+    state.resolveWait?.({ text: "hello", timedOut: false });
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "CONVERSATION_STATE_FAILED",
+      stage: "conversation.save",
+      retryable: false,
+      context: {
+        providerHost: "chatgpt.com"
+      }
+    });
+    expect(state.page.close).toHaveBeenCalledOnce();
   });
 
   it("starts a new conversation when continuation was requested but none exists", async () => {

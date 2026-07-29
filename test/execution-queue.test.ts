@@ -54,9 +54,14 @@ describe("execution queue", () => {
     const queue = makeQueue({ maxActive: 2 });
     const first = await queue.acquire({ provider: "chatgpt", conversationName: "research" });
     const blocked = queue.acquire({ provider: "chatgpt", conversationName: "research" });
+    await vi.waitFor(async () => {
+      await expect(queue.inspect()).resolves.toEqual({ active: 1, queued: 1 });
+    });
     const independent = await queue.acquire({ provider: "chatgpt", conversationName: "notes" });
 
-    await expect(queue.inspect()).resolves.toEqual({ active: 2, queued: 1 });
+    await vi.waitFor(async () => {
+      await expect(queue.inspect()).resolves.toEqual({ active: 2, queued: 1 });
+    });
     await independent.release();
     await expect(queue.inspect()).resolves.toEqual({ active: 1, queued: 1 });
 
