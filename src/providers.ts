@@ -44,6 +44,7 @@ export const providerRegistry: Record<ProviderName, ProviderDefinition> = {
     homeUrl: "https://chatgpt.com/",
     screenshotPrefix: "chatgpt",
     automation: createProviderAutomation({
+    name: "chatgpt",
     displayName: "ChatGPT",
     promptInputSelectors: [
       "#prompt-textarea",
@@ -118,6 +119,7 @@ export const providerRegistry: Record<ProviderName, ProviderDefinition> = {
     homeUrl: "https://gemini.google.com/app",
     screenshotPrefix: "gemini",
     automation: createProviderAutomation({
+    name: "gemini",
     displayName: "Gemini",
     promptInputSelectors: [
       'rich-textarea [contenteditable="true"]',

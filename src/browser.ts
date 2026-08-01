@@ -39,6 +39,13 @@ export interface ChromeSessionInspection {
 
 export type ChromeSessionRequest = Omit<ChromeLaunchOptions, "env">;
 
+export class ChromeSessionConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChromeSessionConflictError";
+  }
+}
+
 export interface ChromeSessionController {
   connect(options?: ChromeSessionRequest): Promise<Browser>;
   inspect(options?: ChromeSessionRequest): Promise<ChromeSessionInspection>;
@@ -128,7 +135,7 @@ function formatOwnershipError(port: number, classification: SessionClassificatio
 async function ensureManagedSession(env: NodeJS.ProcessEnv, port: number, version: RemoteDebuggingVersion): Promise<SessionClassification> {
   const classification = await classifySession(env, port, true);
   if (classification.ownership !== "ask-managed") {
-    throw new Error(formatOwnershipError(port, classification));
+    throw new ChromeSessionConflictError(formatOwnershipError(port, classification));
   }
 
   if (!classification.state && classification.process) {
@@ -167,7 +174,7 @@ async function assertRemoteDebuggingCompatible(port: number, version: RemoteDebu
 
   const currentMode = currentlyHeadless ? "headless" : "visible";
   const requestedMode = requestedHeadless ? "headless" : "visible";
-  throw new Error(
+  throw new ChromeSessionConflictError(
     `Chrome remote debugging on port ${port} is already attached to a ${currentMode} Chrome session, ` +
       `but ${requestedMode} mode was requested and it is not safe to replace the session automatically ` +
       `(${classification.ownership}). ` +

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
-import type { ProviderDefinition } from "./providers";
+import { AskFailure, type AskExecutionStage, type AskFailureCode } from "./errors";
+import type { ProviderDefinition, ProviderName } from "./providers";
 
 export type AuthState = "signed-in-likely" | "guest" | "login-required" | "blocked" | "unknown";
 
@@ -52,6 +53,7 @@ export interface ProviderAutomation {
 }
 
 export interface ProviderAutomationConfig {
+  name: ProviderName;
   displayName: string;
   promptInputSelectors: readonly string[];
   sendButtonSelectors: readonly string[];
@@ -209,7 +211,14 @@ async function findPromptInput(
     }
   }
 
-  throw new Error(`Could not find a visible ${provider.displayName} prompt input within ${timeoutMs}ms.`);
+  throw providerFailure(
+    provider,
+    "PROMPT_INPUT_NOT_FOUND",
+    "prompt.find",
+    `Could not find a visible ${provider.displayName} message box within ${timeoutMs}ms.`,
+    `Run \`ask status --provider ${provider.name} --verbose\`.`,
+    true
+  );
 }
 
 async function hasPromptInput(
@@ -352,10 +361,24 @@ async function attachFiles(
   const resolvedPaths = filePaths.map((filePath) => path.resolve(filePath));
   for (const filePath of resolvedPaths) {
     if (!fs.existsSync(filePath)) {
-      throw new Error(`Attachment file does not exist: ${filePath}`);
+      throw providerFailure(
+        provider,
+        "ATTACHMENT_INVALID",
+        "attachment.upload",
+        `Attachment file does not exist: ${filePath}`,
+        "Check the attachment path, then try again.",
+        false
+      );
     }
     if (!fs.statSync(filePath).isFile()) {
-      throw new Error(`Attachment path is not a regular file: ${filePath}`);
+      throw providerFailure(
+        provider,
+        "ATTACHMENT_INVALID",
+        "attachment.upload",
+        `Attachment path is not a regular file: ${filePath}`,
+        "Choose a regular file instead of a directory, then try again.",
+        false
+      );
     }
   }
 
@@ -381,7 +404,14 @@ async function attachFiles(
   const attachButton = page.locator(provider.attachButtonSelectors.join(", ")).last();
 
   if ((await attachButton.count()) === 0) {
-    throw new Error(`Could not find a compatible file input or attach button for ${provider.displayName} attachment upload.`);
+    throw providerFailure(
+      provider,
+      "ATTACHMENT_UPLOAD_FAILED",
+      "attachment.upload",
+      `Could not find a compatible file input or attach button for ${provider.displayName} attachment upload.`,
+      `Run \`ask status --provider ${provider.name} --verbose\`.`,
+      true
+    );
   }
 
   try {
@@ -466,8 +496,19 @@ async function openFileChooser(page: Page, attachButton: Locator) {
 }
 
 function attachmentUploadError(provider: ProviderAutomationConfig, error: unknown): Error {
+  if (error instanceof AskFailure) {
+    return error;
+  }
   const detail = error instanceof Error ? error.message : String(error);
-  return new Error(`${provider.displayName} could not attach the requested file${detail ? `: ${detail}` : "."}`);
+  return providerFailure(
+    provider,
+    "ATTACHMENT_UPLOAD_FAILED",
+    "attachment.upload",
+    `${provider.displayName} could not attach the requested file${detail ? `: ${detail}` : "."}`,
+    "Check that the file type is supported and try again.",
+    true,
+    error
+  );
 }
 
 async function fillPrompt(
@@ -518,7 +559,14 @@ async function submitPrompt(
   } while (Date.now() - startedAt < timeoutMs);
 
   if (Date.now() - startedAt >= timeoutMs) {
-    throw new Error(`${provider.displayName} send button remained disabled while attachments were processing.`);
+    throw providerFailure(
+      provider,
+      "PROMPT_SUBMIT_FAILED",
+      "prompt.submit",
+      `${provider.displayName} send button remained disabled while attachments were processing.`,
+      "Wait for attachments to finish processing, then try again.",
+      true
+    );
   }
 
   if (input) {
@@ -527,6 +575,27 @@ async function submitPrompt(
   }
 
   await page.keyboard.press("Enter");
+}
+
+function providerFailure(
+  provider: ProviderAutomationConfig,
+  code: AskFailureCode,
+  stage: AskExecutionStage,
+  message: string,
+  hint: string,
+  retryable: boolean,
+  cause?: unknown
+): AskFailure {
+  return new AskFailure({
+    code,
+    stage,
+    provider: provider.name,
+    providerDisplayName: provider.displayName,
+    message,
+    retryable,
+    hint,
+    cause
+  });
 }
 
 async function extractLatestAssistantText(page: Page, provider: ProviderAutomationConfig): Promise<string> {

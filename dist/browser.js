@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.ChromeSessionConflictError = void 0;
 exports.createChromeSessionController = createChromeSessionController;
 exports.getChromeCandidates = getChromeCandidates;
 exports.resolveChromePath = resolveChromePath;
@@ -25,6 +26,13 @@ const node_path_1 = __importDefault(require("node:path"));
 const playwright_core_1 = require("playwright-core");
 const config_1 = require("./config");
 const session_1 = require("./session");
+class ChromeSessionConflictError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = "ChromeSessionConflictError";
+    }
+}
+exports.ChromeSessionConflictError = ChromeSessionConflictError;
 function createChromeSessionController(env = process.env) {
     return {
         connect: (options = {}) => connectToChrome({ ...options, env }),
@@ -87,7 +95,7 @@ function formatOwnershipError(port, classification) {
 async function ensureManagedSession(env, port, version) {
     const classification = await (0, session_1.classifySession)(env, port, true);
     if (classification.ownership !== "ask-managed") {
-        throw new Error(formatOwnershipError(port, classification));
+        throw new ChromeSessionConflictError(formatOwnershipError(port, classification));
     }
     if (!classification.state && classification.process) {
         await (0, session_1.writeProfileMarker)(env);
@@ -119,7 +127,7 @@ async function assertRemoteDebuggingCompatible(port, version, options) {
     }
     const currentMode = currentlyHeadless ? "headless" : "visible";
     const requestedMode = requestedHeadless ? "headless" : "visible";
-    throw new Error(`Chrome remote debugging on port ${port} is already attached to a ${currentMode} Chrome session, ` +
+    throw new ChromeSessionConflictError(`Chrome remote debugging on port ${port} is already attached to a ${currentMode} Chrome session, ` +
         `but ${requestedMode} mode was requested and it is not safe to replace the session automatically ` +
         `(${classification.ownership}). ` +
         `${classification.reason || "The session could not be verified."} Run \`ask status\` to inspect it.`);

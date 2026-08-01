@@ -76,7 +76,7 @@ ask --provider gemini "Explain why the sky is blue"
 | `ask get` | Print the latest response from the current provider page |
 | `ask dump` | Print or save the current provider page HTML |
 | `ask screenshot` | Save a screenshot of the current provider page |
-| `ask status` | Show provider, browser, login, and readiness status |
+| `ask status` | Show Chrome and readiness status for every provider |
 | `ask conversations list` | List locally named conversations |
 | `ask conversations forget <name>` | Forget a local name without deleting the provider chat |
 
@@ -98,6 +98,21 @@ ask --provider gemini "Explain why the sky is blue"
 | `-h, --help` | All commands | Show command help |
 
 Run `ask --help` or `ask <command> --help` for the generated reference.
+
+### Provider status
+
+`ask status` inspects the existing ask-managed Chrome session without launching Chrome or opening provider pages. It shows every configured provider by default:
+
+```console
+$ ask status
+Chrome: running · ask-managed · visible · port 9222
+
+PROVIDER  STATUS    AUTH              MESSAGE BOX
+ChatGPT   ready     signed-in-likely  available
+Gemini    not open  unknown           not checked
+```
+
+Use `ask status --provider gemini` to filter the report. `ASK_PROVIDER` does not filter status output. Here, **message box** means the provider's text editor where `ask` enters a prompt. Use `ask status --verbose` to include page URLs, readiness flags, and notes.
 
 ## Named conversations
 
@@ -184,6 +199,7 @@ Prompts and attachments are sent to the selected provider. Treat the ask home di
 - Run `ask status` for a quick readiness check or `ask status --verbose` for details.
 - Run `ask login` again if the provider is signed out.
 - If port `9222` is already in use, set a different `ASK_HOME` and `ASK_REMOTE_DEBUGGING_PORT`.
+- Provider execution failures identify the failed stage and a stable code, then print a suggested next action. A response timeout still returns any partial response on stdout and exits with code `2`.
 
 ## Development
 
@@ -194,4 +210,4 @@ npm run build
 npm run test:browser
 ```
 
-`npm run test:browser` requires `ASK_CHROME_PATH` and runs isolated pages in a real Chrome process over one debugging port. The opt-in `ASK_LIVE_TEST=1 npm run test:live:parallel` command sends six real ChatGPT prompts, creates provider conversations, and consumes account usage; it is intentionally excluded from the normal test suite.
+`npm run test:browser` requires `ASK_CHROME_PATH` and runs isolated pages in a real Chrome process over one debugging port. `npm run test:e2e:features` uses the same opt-in Chrome path to verify all-provider status and structured failure cleanup against locally intercepted provider fixtures. The opt-in `ASK_LIVE_TEST=1 npm run test:live:parallel` command sends six real ChatGPT prompts, creates provider conversations, and consumes account usage; it is intentionally excluded from the normal test suite.

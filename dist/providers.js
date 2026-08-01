@@ -33,6 +33,7 @@ exports.providerRegistry = {
         homeUrl: "https://chatgpt.com/",
         screenshotPrefix: "chatgpt",
         automation: (0, webchat_1.createProviderAutomation)({
+            name: "chatgpt",
             displayName: "ChatGPT",
             promptInputSelectors: [
                 "#prompt-textarea",
@@ -107,6 +108,7 @@ exports.providerRegistry = {
         homeUrl: "https://gemini.google.com/app",
         screenshotPrefix: "gemini",
         automation: (0, webchat_1.createProviderAutomation)({
+            name: "gemini",
             displayName: "Gemini",
             promptInputSelectors: [
                 'rich-textarea [contenteditable="true"]',
