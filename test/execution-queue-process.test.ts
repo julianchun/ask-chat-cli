@@ -132,6 +132,28 @@ describe("execution queue across processes", () => {
     await expect(guard.completed).resolves.toBe(0);
     await expect(matching.completed).resolves.toBe(0);
   }, 10_000);
+
+  it("elects one provider-readiness leader across processes", async () => {
+    const first = startGuardWorker(askHome, "provider-readiness", 600, "chatgpt");
+    children.push(first.child);
+    await vi.waitFor(() => {
+      expect(first.output()).toContain('"event":"guard-acquired"');
+    }, { timeout: 5_000, interval: 25 });
+
+    const second = startGuardWorker(askHome, "provider-readiness", 10, "chatgpt");
+    const otherProvider = startGuardWorker(askHome, "provider-readiness", 10, "gemini");
+    children.push(second.child, otherProvider.child);
+
+    await vi.waitFor(() => {
+      expect(otherProvider.output()).toContain('"event":"guard-acquired"');
+      expect(second.output()).not.toContain('"event":"guard-acquired"');
+    }, { timeout: 5_000, interval: 25 });
+
+    await expect(otherProvider.completed).resolves.toBe(0);
+    await expect(first.completed).resolves.toBe(0);
+    await expect(second.completed).resolves.toBe(0);
+    expect(second.output()).toContain('"event":"guard-acquired"');
+  }, 10_000);
 });
 
 function startWorker(askHome: string, holdMs: number, conversationName?: string): Worker {
@@ -145,7 +167,7 @@ function startWorker(askHome: string, holdMs: number, conversationName?: string)
 
 function startGuardWorker(
   askHome: string,
-  kind: "browser" | "conversation",
+  kind: "browser" | "conversation" | "provider-readiness",
   holdMs: number,
   provider = "chatgpt",
   conversationName = "release"

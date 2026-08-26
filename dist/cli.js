@@ -55,12 +55,15 @@ function createProgram(services = {}) {
             const conversationName = resolveConversationName(options, program);
             const providerDisplayName = (0, providers_1.getProvider)(provider).displayName;
             const queueProgress = createQueueProgress(stderr, providerDisplayName);
-            const stopWaitingProgress = startWaitingSpinner(stderr, providerDisplayName, newSession, env, () => queueProgress.current);
+            const readinessProgress = createReadinessProgress(stderr);
+            const stopWaitingProgress = startWaitingSpinner(stderr, providerDisplayName, newSession, env, () => queueProgress.current, () => readinessProgress.current);
             let continuationUnavailable = false;
             let elapsedMs = 0;
             let result;
+            const firstAttemptStartedAt = Date.now();
+            const commandTimeoutMs = resolveTimeout(options, program);
             try {
-                result = await runner.ask({
+                const askOptions = {
                     provider,
                     prompt,
                     attachments,
@@ -76,9 +79,33 @@ function createProgram(services = {}) {
                         }
                     }),
                     onQueueUpdate: queueProgress.update,
-                    timeoutMs: options.timeout,
+                    // Authentication in a remotely controlled Chrome can be rejected
+                    // by identity providers. A safe pre-dispatch auth failure below
+                    // switches to the ordinary-Chrome setup bootstrap instead.
+                    allowInteractiveAuth: false,
+                    onReadinessUpdate: readinessProgress.update,
+                    timeoutMs: commandTimeoutMs,
                     verbose: resolveVerbose(options, program)
-                });
+                };
+                try {
+                    result = await runner.ask(askOptions);
+                }
+                catch (error) {
+                    if (!shouldRunSecureSetup(error, stderr, options.headless)) {
+                        throw error;
+                    }
+                    const commandDeadlineAt = (queueProgress.activeAt ?? firstAttemptStartedAt) + Math.max(0, commandTimeoutMs);
+                    result = await retryAfterCoalescedSecureSetup({
+                        runner,
+                        provider,
+                        providerDisplayName,
+                        deadlineAt: commandDeadlineAt,
+                        initialError: error,
+                        verbose: resolveVerbose(options, program),
+                        readinessProgress,
+                        run: (timeoutMs) => runner.ask({ ...askOptions, timeoutMs })
+                    });
+                }
             }
             finally {
                 elapsedMs = stopWaitingProgress();
@@ -97,6 +124,7 @@ function createProgram(services = {}) {
                 }
             }
             if (result.timedOut) {
+                const deliveryState = result.deliveryState || "confirmed";
                 const failure = result.failure || new errors_1.AskFailure({
                     code: result.text ? "RESPONSE_TIMEOUT" : "RESPONSE_NOT_DETECTED",
                     stage: "response.wait",
@@ -105,8 +133,14 @@ function createProgram(services = {}) {
                     message: result.text
                         ? `Timed out waiting for ${providerDisplayName}; returned the latest partial response.`
                         : `Timed out without detecting a ${providerDisplayName} response.`,
-                    retryable: true,
-                    hint: `Retry with a larger \`--timeout\`, or run \`ask status --provider ${provider} --verbose\`.`,
+                    retryable: deliveryState !== "confirmed",
+                    hint: deliveryState === "confirmed"
+                        ? `Prompt delivery was confirmed; do not resend it. Reopen or continue the saved conversation, or run \`ask get --provider ${provider}\`.`
+                        : `Retry with a larger \`--timeout\`, or run \`ask status --provider ${provider} --verbose\`.`,
+                    context: {
+                        deliveryState,
+                        ...(result.conversationUrl ? { conversationUrl: result.conversationUrl } : {})
+                    },
                     exitCode: 2
                 });
                 stderr.write(formatAskFailure(failure));
@@ -115,21 +149,42 @@ function createProgram(services = {}) {
         });
     });
     program
+        .command("setup")
+        .description("Set up a persistent Ask Chrome profile using an ordinary Chrome sign-in window with automation off.")
+        .addOption(providerOption())
+        .option("--timeout <ms>", "time allowed to finish sign-in and fully quit Chrome", args_1.parseTimeout, config_1.DEFAULT_TIMEOUT_MS)
+        .option("-v, --verbose", "print browser/session details")
+        .action(async (options) => {
+        await runWithErrors(stderr, setExitCode, async () => {
+            const provider = resolveCliProvider(options, program, env);
+            const providerDisplayName = (0, providers_1.getProvider)(provider).displayName;
+            writeProgress(stderr, `Opening ordinary Chrome for ${providerDisplayName} sign-in with automation off. Sign in, then fully quit that Chrome instance; Ask will verify and move the managed profile into the background automatically…`);
+            await runner.setup({
+                provider,
+                timeoutMs: resolveTimeout(options, program),
+                verbose: resolveVerbose(options, program)
+            });
+            writeProgress(stderr, `${providerDisplayName} is signed in and ready for Ask.`);
+        });
+    });
+    program
         .command("login")
-        .description("Launch Chrome with the dedicated ask profile so you can log in manually.")
+        .description("Alias for `ask setup`; sign in to the persistent Ask Chrome profile with automation off.")
         .addOption(providerOption())
         .option("--timeout <ms>", "timeout in milliseconds", args_1.parseTimeout, config_1.DEFAULT_TIMEOUT_MS)
         .option("-v, --verbose", "print browser/session details")
         .action(async (options) => {
         await runWithErrors(stderr, setExitCode, async () => {
-            writeProgress(stderr, `Opening ${(0, providers_1.getProvider)(resolveCliProvider(options, program, env)).displayName} for login…`);
+            const provider = resolveCliProvider(options, program, env);
+            const providerDisplayName = (0, providers_1.getProvider)(provider).displayName;
+            writeProgress(stderr, `Opening ordinary Chrome for ${providerDisplayName} sign-in with automation off. Sign in, then fully quit that Chrome instance…`);
             await runner.login({
-                provider: resolveCliProvider(options, program, env),
+                provider,
                 headless: options.headless,
-                timeoutMs: options.timeout,
+                timeoutMs: resolveTimeout(options, program),
                 verbose: resolveVerbose(options, program)
             });
-            writeProgress(stderr, "Login page ready. Complete sign-in in the dedicated Chrome window, then run `ask status`.");
+            writeProgress(stderr, `${providerDisplayName} is signed in and ready for Ask.`);
         });
     });
     const open = program
@@ -147,9 +202,13 @@ function createProgram(services = {}) {
             const target = (0, args_1.resolveOpenTarget)(first, rest, provider);
             const newSession = resolveNewSession(options, program);
             const conversationName = resolveConversationName(options, program);
-            const queueProgress = createQueueProgress(stderr, (0, providers_1.getProvider)(provider).displayName);
-            writeProgress(stderr, `Opening ${(0, providers_1.getProvider)(provider).displayName} ${newSession ? "in a new conversation" : "in the previous conversation"}${options.send ? " and sending the prompt" : ""}…`);
-            await runner.open({
+            const providerDisplayName = (0, providers_1.getProvider)(provider).displayName;
+            const queueProgress = createQueueProgress(stderr, providerDisplayName);
+            const readinessProgress = createReadinessProgress(stderr);
+            const commandTimeoutMs = resolveTimeout(options, program);
+            const firstAttemptStartedAt = Date.now();
+            writeProgress(stderr, `Opening ${providerDisplayName} ${newSession ? "in a new conversation" : "in the previous conversation"}${options.send ? " and sending the prompt" : ""}…`);
+            const openOptions = {
                 provider,
                 url: target.url,
                 prompt: target.prompt,
@@ -163,10 +222,33 @@ function createProgram(services = {}) {
                     }
                 }),
                 onQueueUpdate: queueProgress.update,
-                timeoutMs: options.timeout,
+                // Never foreground a remotely controlled worker for auth. The safe
+                // ordinary-Chrome bootstrap below only runs after a pre-send failure.
+                allowInteractiveAuth: false,
+                onReadinessUpdate: readinessProgress.update,
+                timeoutMs: commandTimeoutMs,
                 verbose: resolveVerbose(options, program),
                 send: Boolean(options.send)
-            });
+            };
+            try {
+                await runner.open(openOptions);
+            }
+            catch (error) {
+                if (!options.send || !shouldRunSecureSetup(error, stderr, options.headless)) {
+                    throw error;
+                }
+                const commandDeadlineAt = (queueProgress.activeAt ?? firstAttemptStartedAt) + Math.max(0, commandTimeoutMs);
+                await retryAfterCoalescedSecureSetup({
+                    runner,
+                    provider,
+                    providerDisplayName,
+                    deadlineAt: commandDeadlineAt,
+                    initialError: error,
+                    verbose: resolveVerbose(options, program),
+                    readinessProgress,
+                    run: (timeoutMs) => runner.open({ ...openOptions, timeoutMs })
+                });
+            }
             writeProgress(stderr, options.send ? "Prompt completed." : "Provider page ready in Chrome.");
         });
     });
@@ -177,7 +259,7 @@ function createProgram(services = {}) {
             const text = await runner.get({
                 provider: resolveCliProvider(options, program, env),
                 headless: options.headless,
-                timeoutMs: options.timeout,
+                timeoutMs: resolveTimeout(options, program),
                 verbose: resolveVerbose(options, program)
             });
             if (!text.trim()) {
@@ -197,7 +279,7 @@ function createProgram(services = {}) {
             const html = await runner.dump({
                 provider: resolveCliProvider(options, program, env),
                 headless: options.headless,
-                timeoutMs: options.timeout,
+                timeoutMs: resolveTimeout(options, program),
                 verbose: resolveVerbose(options, program)
             });
             const outputPath = await (0, io_1.writeTextOutput)(html, { output: resolveOutput(options, program), stdout });
@@ -214,7 +296,7 @@ function createProgram(services = {}) {
             const filePath = await runner.screenshot(output, {
                 provider: resolveCliProvider(options, program, env),
                 headless: options.headless,
-                timeoutMs: options.timeout,
+                timeoutMs: resolveTimeout(options, program),
                 verbose: resolveVerbose(options, program)
             });
             if (!output) {
@@ -316,6 +398,13 @@ function resolveStatusTimeout(options, program) {
     const globalTimeout = program.opts().timeout;
     return typeof globalTimeout === "number" && globalTimeout !== config_1.DEFAULT_TIMEOUT_MS ? globalTimeout : options.timeout;
 }
+function resolveTimeout(options, program) {
+    if (options.timeout !== config_1.DEFAULT_TIMEOUT_MS) {
+        return options.timeout;
+    }
+    const globalTimeout = program.opts().timeout;
+    return typeof globalTimeout === "number" ? globalTimeout : options.timeout;
+}
 function resolveNewSession(options, program) {
     const conversationName = resolveConversationName(options, program);
     const continuePrevious = options.continue ?? program.opts().continue;
@@ -345,7 +434,7 @@ function writeProgress(stderr, message) {
         stderr.write(`${message}\n`);
     }
 }
-function startWaitingSpinner(stderr, providerDisplayName, newSession, env, getQueueUpdate) {
+function startWaitingSpinner(stderr, providerDisplayName, newSession, env, getQueueUpdate, getReadinessUpdate) {
     const startedAt = Date.now();
     if (!isInteractive(stderr)) {
         return () => Date.now() - startedAt;
@@ -356,13 +445,35 @@ function startWaitingSpinner(stderr, providerDisplayName, newSession, env, getQu
     }
     const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let frameIndex = 0;
+    let announcedReadinessPhase;
+    let spinnerVisible = false;
     const render = () => {
         const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
         const queue = getQueueUpdate();
-        const activity = queue?.phase === "queued"
+        const readiness = getReadinessUpdate();
+        if (readiness?.phase === "awaiting-auth") {
+            if (announcedReadinessPhase !== readiness.phase) {
+                if (spinnerVisible) {
+                    stderr.write("\r\x1b[2K");
+                    spinnerVisible = false;
+                }
+                announcedReadinessPhase = readiness.phase;
+            }
+            return;
+        }
+        const readinessActivity = readiness?.phase === "recovering"
+            ? "recovering provider page"
+            : readiness?.phase === "resumed"
+                ? "resuming after sign-in"
+                : readiness?.phase === "submission-uncertain"
+                    ? "checking whether prompt was sent"
+                    : undefined;
+        const activity = readinessActivity || (queue?.phase === "queued"
             ? `queued ${queue.position}/${execution_queue_1.MAX_QUEUED_EXECUTIONS}`
-            : newSession ? "starting new conversation" : "continuing";
+            : newSession ? "starting new conversation" : "continuing");
         stderr.write(`\r\x1b[2K${frames[frameIndex]} ${providerDisplayName} · ${activity} · ${elapsedSeconds}s`);
+        spinnerVisible = true;
+        announcedReadinessPhase = readiness?.phase;
         frameIndex = (frameIndex + 1) % frames.length;
     };
     render();
@@ -372,15 +483,42 @@ function startWaitingSpinner(stderr, providerDisplayName, newSession, env, getQu
     timer.unref();
     return () => {
         clearInterval(timer);
-        stderr.write("\r\x1b[2K");
+        if (spinnerVisible) {
+            stderr.write("\r\x1b[2K");
+        }
         return Date.now() - startedAt;
     };
+}
+function createReadinessProgress(stderr) {
+    const progress = {
+        update(update) {
+            const previous = progress.current;
+            progress.current = update;
+            if (previous?.phase === update.phase) {
+                return;
+            }
+            if (isInteractive(stderr)) {
+                if (update.phase === "awaiting-auth") {
+                    stderr.write(`\r\x1b[2K${update.message}\n`);
+                }
+                else if (update.phase === "resumed" && previous?.phase === "awaiting-auth") {
+                    stderr.write(`${update.message}\n`);
+                }
+                return;
+            }
+            stderr.write(`${update.message}\n`);
+        }
+    };
+    return progress;
 }
 function createQueueProgress(stderr, providerDisplayName) {
     const progress = {
         update(update) {
             const previous = progress.current;
             progress.current = update;
+            if (update.phase === "active" && progress.activeAt === undefined) {
+                progress.activeAt = Date.now();
+            }
             if (isInteractive(stderr)) {
                 return;
             }
@@ -411,8 +549,80 @@ function formatElapsed(elapsedMs) {
     }
     return `${Math.round(elapsedMs / 1_000)}s`;
 }
+function remainingTimeout(deadlineAt) {
+    return Math.max(0, Math.ceil(deadlineAt - Date.now()));
+}
 function isInteractive(stderr) {
     return Boolean(stderr.isTTY);
+}
+function shouldRunSecureSetup(error, stderr, headless) {
+    if (!isInteractive(stderr) || headless || !(error instanceof errors_1.AskFailure)) {
+        return false;
+    }
+    if (error.context?.deliveryState !== "not-attempted") {
+        return false;
+    }
+    return error.code === "AUTH_REQUIRED" ||
+        error.code === "AUTH_UNCONFIRMED";
+}
+/**
+ * A provider readiness lease covers only a read-only readiness recheck and
+ * the human setup flow. Prompt execution never runs under it: after the lease
+ * is released, every command gets one original retry with its own remaining
+ * deadline. Only a still-observed auth failure opens ordinary Chrome.
+ */
+async function retryAfterCoalescedSecureSetup(options) {
+    const leaseTimeoutMs = remainingTimeout(options.deadlineAt);
+    if (leaseTimeoutMs <= 0) {
+        throw options.initialError;
+    }
+    const lease = await options.runner.acquireProviderReadinessLease(options.provider, leaseTimeoutMs);
+    try {
+        const readinessTimeoutMs = remainingTimeout(options.deadlineAt);
+        if (readinessTimeoutMs <= 0) {
+            throw options.initialError;
+        }
+        let readiness = "unavailable";
+        try {
+            readiness = await options.runner.inspectProviderReadiness(options.provider, readinessTimeoutMs);
+        }
+        catch {
+            // An inspection outage is not proof that credentials are missing. The
+            // one direct retry below returns its own safe structured failure.
+        }
+        if (readiness === "auth-required" || readiness === "auth-unconfirmed") {
+            const setupTimeoutMs = remainingTimeout(options.deadlineAt);
+            if (setupTimeoutMs <= 0) {
+                throw options.initialError;
+            }
+            options.readinessProgress.update({
+                phase: "awaiting-auth",
+                provider: options.provider,
+                message: `Finish ${options.providerDisplayName} sign-in in the ordinary Chrome window (automation is off), then fully quit that Chrome instance.`
+            });
+            await options.runner.setup({
+                provider: options.provider,
+                timeoutMs: setupTimeoutMs,
+                verbose: options.verbose
+            });
+            options.readinessProgress.update({
+                phase: "resumed",
+                provider: options.provider,
+                message: `${options.providerDisplayName} sign-in verified; resuming the original prompt.`
+            });
+        }
+    }
+    finally {
+        await lease.release();
+    }
+    const retryTimeoutMs = remainingTimeout(options.deadlineAt);
+    if (retryTimeoutMs <= 0) {
+        throw options.initialError;
+    }
+    // This final original command is intentionally outside the readiness lease:
+    // it may take the full response budget, while other followers can observe
+    // ready state and proceed. Never wrap it in this recovery again.
+    return options.run(retryTimeoutMs);
 }
 function formatStatus(report, verbose = false) {
     const lines = [
@@ -427,13 +637,17 @@ function formatStatus(report, verbose = false) {
 }
 function formatChromeStatus(report) {
     const session = report.session;
+    const placement = session.placement || (session.headless ? "headless" : "unknown");
+    const port = typeof session.port === "number"
+        ? `port ${session.port}`
+        : session.portPolicy === "automatic" ? "port auto" : "port unassigned";
     if (!session.connected || session.sessionOwnership === "absent") {
-        return `Chrome: not running · port ${session.port}`;
+        return `Chrome: not running · ${port}`;
     }
     if (session.sessionOwnership !== "ask-managed") {
-        return `Chrome: session conflict · ${session.sessionOwnership} · port ${session.port}`;
+        return `Chrome: session conflict · ${session.sessionOwnership} · ${port}`;
     }
-    return `Chrome: running · ask-managed · ${session.headless ? "headless" : "visible"} · port ${session.port}`;
+    return `Chrome: running · ask-managed · ${placement} · ${port}`;
 }
 function formatStatusTable(report) {
     const rows = [
@@ -452,10 +666,16 @@ function formatStatusTable(report) {
 }
 function formatVerboseStatus(report) {
     const session = report.session;
+    const placement = session.placement || (session.headless ? "headless" : "unknown");
+    const endpoint = typeof session.port === "number"
+        ? `port ${session.port}`
+        : session.portPolicy === "automatic" ? "automatic port (not assigned)" : "pinned port (not assigned)";
     const lines = [
         `Session: ${session.sessionOwnership}`,
-        `Chrome debugging: ${session.connected ? "connected" : "not running"} on port ${session.port}`,
-        `Chrome mode: ${session.connected ? (session.headless ? "headless" : "visible") : "n/a"}`,
+        `Chrome debugging: ${session.connected ? "connected" : "not running"} on ${endpoint}`,
+        `Port policy: ${session.portPolicy}`,
+        `Chrome mode: ${session.connected ? (session.headless ? "headless" : "headed") : "n/a"}`,
+        `Window placement: ${session.connected ? placement : "n/a"}`,
         `Browser: ${session.browser || "unknown"}`,
         `User agent: ${session.userAgent || "unknown"}`,
         `Pages: ${session.pageCount} total`
@@ -495,6 +715,18 @@ function formatAskFailure(error) {
     }
     if (typeof error.context?.promptInputVisible === "boolean") {
         context.push(`message-box=${error.context.promptInputVisible ? "available" : "not-found"}`);
+    }
+    if (error.context?.deliveryState) {
+        context.push(`delivery=${error.context.deliveryState}`);
+    }
+    if (typeof error.context?.recoveryAttempts === "number") {
+        context.push(`recoveries=${error.context.recoveryAttempts}`);
+    }
+    if (error.context?.capability) {
+        context.push(`capability=${error.context.capability}`);
+    }
+    if (error.context?.conversationUrl) {
+        context.push(`conversation=${error.context.conversationUrl}`);
     }
     if (context.length > 0) {
         lines.push(`Context: ${context.join(" · ")}`);

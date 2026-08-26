@@ -13,6 +13,8 @@ async function main() {
         exclusive: true,
         action: "test browser maintenance"
       })
+    : kind === "provider-readiness"
+    ? await queue.acquireProviderReadinessLease(provider)
     : await queue.acquireConversationLease(provider, conversationName);
   process.stdout.write(`${JSON.stringify({ event: "guard-acquired", id: lease.id })}\n`);
   await new Promise((resolve) => setTimeout(resolve, holdMs));

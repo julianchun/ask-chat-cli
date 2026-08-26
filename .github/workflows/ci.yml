@@ -11,9 +11,24 @@ permissions:
 
 jobs:
   verify:
-    name: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    # The real-Chrome and account-backed suites are intentionally opt-in.
+    # The explicitly selected portable suite stays independent of Chrome
+    # installation and login state.
+    env:
+      ASK_LIVE_CAPABILITY_TEST: "0"
+      ASK_LIVE_TEST: "0"
 
     steps:
       - name: Check out repository
@@ -31,8 +46,14 @@ jobs:
       - name: Type-check
         run: npm run typecheck
 
-      - name: Build and test
-        run: npm test
+      - name: Build
+        run: npm run build
+
+      - name: Run portable unit tests
+        run: npm run test:unit
+
+      - name: Check whitespace
+        run: git diff --check
 
       - name: Verify generated files
         run: git diff --exit-code -- dist

@@ -11,16 +11,23 @@ export class CliError extends Error {
   }
 }
 
+export type PromptDeliveryState = "not-attempted" | "confirmed" | "unknown";
+
 export type AskExecutionStage =
   | "queue.acquire"
   | "browser.connect"
   | "conversation.resolve"
   | "page.open"
+  | "readiness.discover"
+  | "readiness.recover"
   | "auth.inspect"
+  | "auth.handoff"
   | "attachment.upload"
   | "prompt.find"
+  | "prompt.verify"
   | "response.baseline"
   | "prompt.submit"
+  | "prompt.confirm"
   | "response.wait"
   | "conversation.save";
 
@@ -28,13 +35,17 @@ export type AskFailureCode =
   | "QUEUE_UNAVAILABLE"
   | "BROWSER_UNAVAILABLE"
   | "SESSION_CONFLICT"
+  | "SESSION_CONFIG_MISMATCH"
   | "AUTH_REQUIRED"
   | "AUTH_UNCONFIRMED"
+  | "AUTH_HANDOFF_TIMEOUT"
   | "PROVIDER_BLOCKED"
   | "ATTACHMENT_INVALID"
   | "ATTACHMENT_UPLOAD_FAILED"
   | "PROMPT_INPUT_NOT_FOUND"
+  | "PROMPT_FILL_UNCONFIRMED"
   | "PROMPT_SUBMIT_FAILED"
+  | "PROMPT_DELIVERY_UNKNOWN"
   | "RESPONSE_TIMEOUT"
   | "RESPONSE_NOT_DETECTED"
   | "CONVERSATION_STATE_FAILED"
@@ -44,6 +55,11 @@ export interface AskFailureContext {
   providerHost?: string;
   authState?: AuthState;
   promptInputVisible?: boolean;
+  operationId?: string;
+  deliveryState?: PromptDeliveryState;
+  recoveryAttempts?: number;
+  capability?: string;
+  conversationUrl?: string;
 }
 
 export interface AskFailureOptions {

@@ -6,7 +6,20 @@ exports.parseProviderName = parseProviderName;
 exports.resolveProviderName = resolveProviderName;
 exports.getProvider = getProvider;
 const webchat_1 = require("./webchat");
+const provider_execution_1 = require("./provider-execution");
 exports.PROVIDER_NAMES = ["chatgpt", "gemini"];
+function withChatGptExecution(automation, matchesConversationUrl) {
+    return {
+        automation,
+        execution: (0, provider_execution_1.createChatGptExecutionAdapter)({ automation, matchesConversationUrl })
+    };
+}
+function withGeminiExecution(automation, matchesConversationUrl) {
+    return {
+        automation,
+        execution: (0, provider_execution_1.createGeminiExecutionAdapter)({ automation, matchesConversationUrl })
+    };
+}
 exports.DEFAULT_PROVIDER_NAME = "chatgpt";
 function isUrlOnHost(value, predicate) {
     if (!value) {
@@ -26,13 +39,21 @@ function isChatGptHost(hostname) {
 function isGeminiHost(hostname) {
     return hostname === "gemini.google.com";
 }
+function matchesChatGptConversationUrl(value) {
+    const url = isUrlOnHost(value, isChatGptHost);
+    return Boolean(url && /^\/c\/[^/]+/.test(url.pathname));
+}
+function matchesGeminiConversationUrl(value) {
+    const url = isUrlOnHost(value, isGeminiHost);
+    return Boolean(url && /^\/app\/[^/]+/.test(url.pathname));
+}
 exports.providerRegistry = {
     chatgpt: {
         name: "chatgpt",
         displayName: "ChatGPT",
         homeUrl: "https://chatgpt.com/",
         screenshotPrefix: "chatgpt",
-        automation: (0, webchat_1.createProviderAutomation)({
+        ...withChatGptExecution((0, webchat_1.createProviderAutomation)({
             name: "chatgpt",
             displayName: "ChatGPT",
             promptInputSelectors: [
@@ -93,13 +114,12 @@ exports.providerRegistry = {
                 'text=/try again later/i',
                 'text=/rate limit/i'
             ]
-        }),
+        }), matchesChatGptConversationUrl),
         matchesPageUrl(value) {
             return Boolean(isUrlOnHost(value, isChatGptHost));
         },
         matchesConversationUrl(value) {
-            const url = isUrlOnHost(value, isChatGptHost);
-            return Boolean(url && /^\/c\/[^/]+/.test(url.pathname));
+            return matchesChatGptConversationUrl(value);
         }
     },
     gemini: {
@@ -107,7 +127,7 @@ exports.providerRegistry = {
         displayName: "Gemini",
         homeUrl: "https://gemini.google.com/app",
         screenshotPrefix: "gemini",
-        automation: (0, webchat_1.createProviderAutomation)({
+        ...withGeminiExecution((0, webchat_1.createProviderAutomation)({
             name: "gemini",
             displayName: "Gemini",
             promptInputSelectors: [
@@ -148,7 +168,13 @@ exports.providerRegistry = {
                 ".prose",
                 "p"
             ],
-            assistantCompletionSelectors: ['button[aria-label="Copy"]'],
+            // This legacy completion affordance is used only by response observation,
+            // never for dispatch confirmation. There is no repository-proven Gemini
+            // busy surface, so the coordinator does not emit a busy submission signal.
+            // Current Gemini does not expose a stable completion action on every
+            // response. The legacy waiter therefore completes after response text is
+            // stable and no stop/streaming affordance remains.
+            assistantCompletionSelectors: [],
             assistantBusySelectors: [],
             fileInputSelectors: ['input[type="file"]'],
             attachButtonSelectors: [
@@ -176,13 +202,12 @@ exports.providerRegistry = {
                 'text=/unusual traffic/i',
                 'text=/try again later/i'
             ]
-        }),
+        }), matchesGeminiConversationUrl),
         matchesPageUrl(value) {
             return Boolean(isUrlOnHost(value, isGeminiHost));
         },
         matchesConversationUrl(value) {
-            const url = isUrlOnHost(value, isGeminiHost);
-            return Boolean(url && /^\/app\/[^/]+/.test(url.pathname));
+            return matchesGeminiConversationUrl(value);
         }
     }
 };

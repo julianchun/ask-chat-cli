@@ -41,7 +41,7 @@ interface ExecutionGuard {
   processCreationTime?: string;
   processCheckedAt: number;
   createdAt: number;
-  kind: "browser" | "conversation";
+  kind: "browser" | "conversation" | "provider-readiness";
   headless?: boolean;
   exclusive?: boolean;
   provider?: ProviderName;
@@ -72,6 +72,10 @@ export interface ExecutionLease {
 export interface BrowserLeaseRequest {
   headless: boolean;
   exclusive?: boolean;
+  /** Wait for active executions and browser guards to drain before acquiring an exclusive lease. */
+  waitForIdle?: boolean;
+  /** Deadline used only while waiting for an idle exclusive lease. */
+  timeoutMs?: number;
   action: string;
 }
 
@@ -93,6 +97,7 @@ interface ExecutionQueueOptions {
 export interface ExecutionQueue {
   acquire(request: ExecutionRequest): Promise<ExecutionLease>;
   acquireBrowserLease(request: BrowserLeaseRequest): Promise<ExecutionLease>;
+  acquireProviderReadinessLease(provider: ProviderName, timeoutMs?: number): Promise<ExecutionLease>;
   acquireConversationLease(provider: ProviderName, conversationName: string): Promise<ExecutionLease>;
   inspect(): Promise<ExecutionQueueSnapshot>;
   assertNoActive(action: string): Promise<void>;
@@ -232,6 +237,56 @@ export function createExecutionQueue(
         headless: request.headless,
         exclusive: Boolean(request.exclusive)
       });
+
+      if (request.exclusive && request.waitForIdle) {
+        const idleWaitTimeoutMs = Math.max(0, request.timeoutMs ?? waitTimeoutMs);
+        const deadline = now() + idleWaitTimeoutMs;
+        try {
+          while (true) {
+            const acquired = await updateState(env, now, inspectProcess, (state) => {
+              promoteEligible(state, maxActive, now());
+              const browserGuards = state.guards.filter((entry) => entry.kind === "browser");
+              const anotherExclusiveGuard = browserGuards.some(
+                (entry) => entry.exclusive && entry.id !== guard.id
+              );
+              if (anotherExclusiveGuard) {
+                return false;
+              }
+
+              if (!state.guards.some((entry) => entry.id === guard.id)) {
+                // Reserve the exclusive transition while existing operations
+                // drain. This prevents a new prompt from racing into the gap
+                // between the idle check and setup's browser connection.
+                state.guards.push(guard);
+              }
+
+              const otherBrowserGuards = state.guards.some(
+                (entry) => entry.kind === "browser" && entry.id !== guard.id
+              );
+              return state.active.length === 0 && !otherBrowserGuards;
+            });
+
+            if (acquired) {
+              return guardLease(env, guard.id, now, inspectProcess, maxActive);
+            }
+            if (now() >= deadline) {
+              throw new Error(
+                `ask: timed out after ${Math.ceil(idleWaitTimeoutMs / 1000)} seconds waiting to ${request.action} until the browser is idle`
+              );
+            }
+            await delay(Math.min(pollMs, Math.max(1, deadline - now())));
+          }
+        } catch (error) {
+          // The reservation may have been installed before the timeout or a
+          // state-write failure. Remove it so queued work can continue.
+          await updateState(env, now, inspectProcess, (state) => {
+            state.guards = state.guards.filter((entry) => entry.id !== guard.id);
+            promoteEligible(state, maxActive, now());
+          }).catch(() => undefined);
+          throw error;
+        }
+      }
+
       await updateState(env, now, inspectProcess, (state) => {
         promoteEligible(state, maxActive, now());
         const browserGuards = state.guards.filter((entry) => entry.kind === "browser");
@@ -254,6 +309,35 @@ export function createExecutionQueue(
         state.guards.push(guard);
       });
       return guardLease(env, guard.id, now, inspectProcess, maxActive);
+    },
+
+    acquireProviderReadinessLease: async (provider, readinessTimeoutMs = waitTimeoutMs) => {
+      const guard = await createGuard("provider-readiness", now, inspectProcess, { provider });
+      const deadline = now() + readinessTimeoutMs;
+
+      while (true) {
+        const acquired = await updateState(env, now, inspectProcess, (state) => {
+          promoteEligible(state, maxActive, now());
+          const existing = state.guards.some(
+            (entry) => entry.kind === "provider-readiness" && entry.provider === provider
+          );
+          if (existing) {
+            return false;
+          }
+          state.guards.push(guard);
+          return true;
+        });
+
+        if (acquired) {
+          return guardLease(env, guard.id, now, inspectProcess, maxActive);
+        }
+        if (now() >= deadline) {
+          throw new Error(
+            `ask: timed out after ${Math.ceil(readinessTimeoutMs / 1000)} seconds waiting for ${provider} readiness`
+          );
+        }
+        await delay(Math.min(pollMs, Math.max(1, deadline - now())));
+      }
     },
 
     acquireConversationLease: async (provider, conversationName) => {

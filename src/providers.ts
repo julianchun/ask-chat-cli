@@ -1,4 +1,9 @@
 import { createProviderAutomation, type ProviderAutomation } from "./webchat";
+import {
+  createChatGptExecutionAdapter,
+  createGeminiExecutionAdapter,
+  type ProviderExecutionAdapter
+} from "./provider-execution";
 
 export const PROVIDER_NAMES = ["chatgpt", "gemini"] as const;
 
@@ -10,8 +15,36 @@ export interface ProviderDefinition {
   homeUrl: string;
   screenshotPrefix: string;
   automation: ProviderAutomation;
+  /** Present only for providers using the evidence-driven, single-dispatch track. */
+  execution?: ProviderExecutionAdapter;
   matchesPageUrl: (value: string) => boolean;
   matchesConversationUrl: (value: string | undefined) => boolean;
+}
+
+function withChatGptExecution(
+  automation: ProviderAutomation,
+  matchesConversationUrl: (value: string | undefined) => boolean
+): {
+  automation: ProviderAutomation;
+  execution: ProviderExecutionAdapter;
+} {
+  return {
+    automation,
+    execution: createChatGptExecutionAdapter({ automation, matchesConversationUrl })
+  };
+}
+
+function withGeminiExecution(
+  automation: ProviderAutomation,
+  matchesConversationUrl: (value: string | undefined) => boolean
+): {
+  automation: ProviderAutomation;
+  execution: ProviderExecutionAdapter;
+} {
+  return {
+    automation,
+    execution: createGeminiExecutionAdapter({ automation, matchesConversationUrl })
+  };
 }
 
 export const DEFAULT_PROVIDER_NAME: ProviderName = "chatgpt";
@@ -37,13 +70,23 @@ function isGeminiHost(hostname: string): boolean {
   return hostname === "gemini.google.com";
 }
 
+function matchesChatGptConversationUrl(value: string | undefined): boolean {
+  const url = isUrlOnHost(value, isChatGptHost);
+  return Boolean(url && /^\/c\/[^/]+/.test(url.pathname));
+}
+
+function matchesGeminiConversationUrl(value: string | undefined): boolean {
+  const url = isUrlOnHost(value, isGeminiHost);
+  return Boolean(url && /^\/app\/[^/]+/.test(url.pathname));
+}
+
 export const providerRegistry: Record<ProviderName, ProviderDefinition> = {
   chatgpt: {
     name: "chatgpt",
     displayName: "ChatGPT",
     homeUrl: "https://chatgpt.com/",
     screenshotPrefix: "chatgpt",
-    automation: createProviderAutomation({
+    ...withChatGptExecution(createProviderAutomation({
     name: "chatgpt",
     displayName: "ChatGPT",
     promptInputSelectors: [
@@ -104,13 +147,12 @@ export const providerRegistry: Record<ProviderName, ProviderDefinition> = {
       'text=/try again later/i',
       'text=/rate limit/i'
     ]
-    }),
+    }), matchesChatGptConversationUrl),
     matchesPageUrl(value: string): boolean {
       return Boolean(isUrlOnHost(value, isChatGptHost));
     },
     matchesConversationUrl(value: string | undefined): boolean {
-      const url = isUrlOnHost(value, isChatGptHost);
-      return Boolean(url && /^\/c\/[^/]+/.test(url.pathname));
+      return matchesChatGptConversationUrl(value);
     }
   },
   gemini: {
@@ -118,7 +160,7 @@ export const providerRegistry: Record<ProviderName, ProviderDefinition> = {
     displayName: "Gemini",
     homeUrl: "https://gemini.google.com/app",
     screenshotPrefix: "gemini",
-    automation: createProviderAutomation({
+    ...withGeminiExecution(createProviderAutomation({
     name: "gemini",
     displayName: "Gemini",
     promptInputSelectors: [
@@ -159,7 +201,13 @@ export const providerRegistry: Record<ProviderName, ProviderDefinition> = {
       ".prose",
       "p"
     ],
-    assistantCompletionSelectors: ['button[aria-label="Copy"]'],
+    // This legacy completion affordance is used only by response observation,
+    // never for dispatch confirmation. There is no repository-proven Gemini
+    // busy surface, so the coordinator does not emit a busy submission signal.
+    // Current Gemini does not expose a stable completion action on every
+    // response. The legacy waiter therefore completes after response text is
+    // stable and no stop/streaming affordance remains.
+    assistantCompletionSelectors: [],
     assistantBusySelectors: [],
     fileInputSelectors: ['input[type="file"]'],
     attachButtonSelectors: [
@@ -187,13 +235,12 @@ export const providerRegistry: Record<ProviderName, ProviderDefinition> = {
       'text=/unusual traffic/i',
       'text=/try again later/i'
     ]
-    }),
+    }), matchesGeminiConversationUrl),
     matchesPageUrl(value: string): boolean {
       return Boolean(isUrlOnHost(value, isGeminiHost));
     },
     matchesConversationUrl(value: string | undefined): boolean {
-      const url = isUrlOnHost(value, isGeminiHost);
-      return Boolean(url && /^\/app\/[^/]+/.test(url.pathname));
+      return matchesGeminiConversationUrl(value);
     }
   }
 };
