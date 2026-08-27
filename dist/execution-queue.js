@@ -33,7 +33,7 @@ function createExecutionQueue(env = process.env, options = {}) {
     const waitTimeoutMs = options.waitTimeoutMs ?? exports.EXECUTION_QUEUE_WAIT_TIMEOUT_MS;
     const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
     const now = options.now ?? Date.now;
-    const inspectProcess = options.getProcessInfo ?? session_1.getProcessInfo;
+    const inspectProcess = options.getProcessInfo ?? getExecutionOwnerProcessInfo;
     const handleSignals = options.handleSignals ?? true;
     return {
         acquire: async (request) => {
@@ -257,6 +257,17 @@ function createExecutionQueue(env = process.env, options = {}) {
             }
         }
     };
+}
+async function getExecutionOwnerProcessInfo(pid) {
+    if (process.platform === "win32") {
+        // Queue owners intentionally omit Windows creation-time metadata because
+        // obtaining it requires PowerShell/WMI. Refreshing several owners while
+        // holding the state lock would otherwise make concurrent releases exceed
+        // the lock deadline. PID liveness is the strongest comparable evidence in
+        // that state and remains fail-closed when inspection is denied.
+        return (0, session_1.isProcessAlive)(pid) ? { pid } : undefined;
+    }
+    return (0, session_1.getProcessInfo)(pid);
 }
 function locateEntry(state, id, currentTime) {
     const activeIndex = state.active.findIndex((entry) => entry.id === id);

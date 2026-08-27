@@ -54,9 +54,11 @@ describe("execution queue across processes", () => {
     await expect(overflow.completed).resolves.toBe(1);
     expect(overflow.error()).toContain("execution queue is full (4 active, 4 waiting)");
 
-    await expect(Promise.all(workers.map((worker) => worker.completed))).resolves.toEqual(
-      Array.from({ length: 8 }, () => 0)
-    );
+    const exitCodes = await Promise.all(workers.map((worker) => worker.completed));
+    expect(
+      exitCodes,
+      workers.map((worker, index) => `worker ${index + 1}: ${worker.error().trim() || "no stderr"}`).join("\n")
+    ).toEqual(Array.from({ length: 8 }, () => 0));
     for (const worker of workers) {
       expect(worker.output()).toContain('"event":"acquired"');
       expect(worker.output()).toContain('"event":"released"');

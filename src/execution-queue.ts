@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getAskHome } from "./config";
 import type { ProviderName } from "./providers";
-import { getProcessInfo, type ProcessInfo } from "./session";
+import { getProcessInfo, isProcessAlive, type ProcessInfo } from "./session";
 
 export const MAX_ACTIVE_EXECUTIONS = 4;
 export const MAX_QUEUED_EXECUTIONS = 4;
@@ -122,7 +122,7 @@ export function createExecutionQueue(
   const waitTimeoutMs = options.waitTimeoutMs ?? EXECUTION_QUEUE_WAIT_TIMEOUT_MS;
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
   const now = options.now ?? Date.now;
-  const inspectProcess = options.getProcessInfo ?? getProcessInfo;
+  const inspectProcess = options.getProcessInfo ?? getExecutionOwnerProcessInfo;
   const handleSignals = options.handleSignals ?? true;
 
   return {
@@ -394,6 +394,18 @@ export function createExecutionQueue(
       }
     }
   };
+}
+
+async function getExecutionOwnerProcessInfo(pid: number): Promise<ProcessInfo | undefined> {
+  if (process.platform === "win32") {
+    // Queue owners intentionally omit Windows creation-time metadata because
+    // obtaining it requires PowerShell/WMI. Refreshing several owners while
+    // holding the state lock would otherwise make concurrent releases exceed
+    // the lock deadline. PID liveness is the strongest comparable evidence in
+    // that state and remains fail-closed when inspection is denied.
+    return isProcessAlive(pid) ? { pid } : undefined;
+  }
+  return getProcessInfo(pid);
 }
 
 type LocatedEntry = ExecutionQueueUpdate | { phase: "missing" };
