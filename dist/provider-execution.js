@@ -71,11 +71,13 @@ async function executeProviderPrompt(page, adapter, options) {
     const permit = new PromptDispatchPermit();
     permit.consume(prepared.dispatch.name);
     let dispatchError;
+    let dispatchDeadlineExceeded = false;
     try {
         await withAbsoluteDeadline(() => prepared.dispatch.dispatch(), deadline.deadlineAt);
     }
     catch (error) {
         dispatchError = error;
+        dispatchDeadlineExceeded = error instanceof DeadlineExceededError;
     }
     // From this point on all code is observation-only. A thrown click/press can still
     // mean the browser received the event, so falling back would risk a duplicate turn.
@@ -104,7 +106,7 @@ async function executeProviderPrompt(page, adapter, options) {
             dispatchError: errorMessage(dispatchError)
         });
     }
-    while (deadline.remainingMs() > 0) {
+    while (!dispatchDeadlineExceeded && deadline.remainingMs() > 0) {
         try {
             const observation = await withAbsoluteDeadline(() => adapter.observeSubmission(page, prepared.baseline, options.prompt), deadline.deadlineAt);
             for (const item of observation.evidence) {

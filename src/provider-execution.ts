@@ -363,6 +363,7 @@ export async function executeProviderPrompt(
   permit.consume(prepared.dispatch.name);
 
   let dispatchError: unknown;
+  let dispatchDeadlineExceeded = false;
   try {
     await withAbsoluteDeadline(
       () => prepared.dispatch.dispatch(),
@@ -370,6 +371,7 @@ export async function executeProviderPrompt(
     );
   } catch (error) {
     dispatchError = error;
+    dispatchDeadlineExceeded = error instanceof DeadlineExceededError;
   }
 
   // From this point on all code is observation-only. A thrown click/press can still
@@ -405,7 +407,7 @@ export async function executeProviderPrompt(
     });
   }
 
-  while (deadline.remainingMs() > 0) {
+  while (!dispatchDeadlineExceeded && deadline.remainingMs() > 0) {
     try {
       const observation = await withAbsoluteDeadline(
         () => adapter.observeSubmission(
