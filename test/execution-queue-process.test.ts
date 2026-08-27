@@ -42,18 +42,31 @@ describe("execution queue across processes", () => {
   });
 
   it("admits four workers, queues four, and rejects a ninth", async () => {
-    const workers = Array.from({ length: 8 }, () => startWorker(askHome, 3_000));
+    const releasePath = path.join(askHome, "release-workers");
+    const workers = Array.from(
+      { length: 8 },
+      () => startWorker(askHome, 30_000, undefined, releasePath)
+    );
     children.push(...workers.map((worker) => worker.child));
 
-    await vi.waitFor(async () => {
-      await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 4 });
-    }, { timeout: 5_000, interval: 25 });
+    await vi.waitFor(() => {
+      const acquired = workers.filter((worker) =>
+        worker.output().includes('"event":"acquired"')
+      );
+      const queued = workers.filter((worker) =>
+        worker.output().includes('"event":"queued"')
+      );
+      expect(acquired).toHaveLength(4);
+      expect(queued).toHaveLength(4);
+    }, { timeout: 10_000, interval: 25 });
+    await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 4 });
 
     const overflow = startWorker(askHome, 10);
     children.push(overflow.child);
     await expect(overflow.completed).resolves.toBe(1);
     expect(overflow.error()).toContain("execution queue is full (4 active, 4 waiting)");
 
+    await fs.promises.writeFile(releasePath, "release\n", "utf8");
     const exitCodes = await Promise.all(workers.map((worker) => worker.completed));
     expect(
       exitCodes,
@@ -64,7 +77,7 @@ describe("execution queue across processes", () => {
       expect(worker.output()).toContain('"event":"released"');
     }
     await expect(readCounts(askHome)).resolves.toEqual({ active: 0, queued: 0 });
-  }, 15_000);
+  }, 20_000);
 
   it("reclaims a slot after an active worker crashes", async () => {
     const active = Array.from({ length: 4 }, () => startWorker(askHome, 10_000));
@@ -87,7 +100,11 @@ describe("execution queue across processes", () => {
   }, 10_000);
 
   it("removes a queued worker when it is interrupted", async () => {
-    const active = Array.from({ length: 4 }, () => startWorker(askHome, 10_000));
+    const releasePath = path.join(askHome, "hold-active-workers");
+    const active = Array.from(
+      { length: 4 },
+      () => startWorker(askHome, 30_000, undefined, releasePath)
+    );
     children.push(...active.map((worker) => worker.child));
     await vi.waitFor(async () => {
       await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 0 });
@@ -95,9 +112,10 @@ describe("execution queue across processes", () => {
 
     const waiting = startWorker(askHome, 10_000);
     children.push(waiting.child);
-    await vi.waitFor(async () => {
-      await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 1 });
-    }, { timeout: 5_000, interval: 25 });
+    await vi.waitFor(() => {
+      expect(waiting.output()).toContain('"event":"queued"');
+    }, { timeout: 10_000, interval: 25 });
+    await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 1 });
 
     waiting.child.kill("SIGTERM");
     await waiting.completed;
@@ -168,13 +186,22 @@ describe("execution queue across processes", () => {
   }, 10_000);
 });
 
-function startWorker(askHome: string, holdMs: number, conversationName?: string): Worker {
+function startWorker(
+  askHome: string,
+  holdMs: number,
+  conversationName?: string,
+  releasePath?: string
+): Worker {
   const fixture = path.join(__dirname, "fixtures", "execution-worker.cjs");
   const args = [fixture, "chatgpt", String(holdMs)];
   if (conversationName) {
     args.push(conversationName);
   }
-  return startChild(askHome, args);
+  return startChild(
+    askHome,
+    args,
+    releasePath ? { ASK_TEST_RELEASE_FILE: releasePath } : undefined
+  );
 }
 
 function startGuardWorker(
@@ -188,9 +215,13 @@ function startGuardWorker(
   return startChild(askHome, [fixture, kind, String(holdMs), provider, conversationName]);
 }
 
-function startChild(askHome: string, args: string[]): Worker {
+function startChild(
+  askHome: string,
+  args: string[],
+  extraEnv: NodeJS.ProcessEnv = {}
+): Worker {
   const child = spawn(process.execPath, args, {
-    env: { ...process.env, ASK_HOME: askHome },
+    env: { ...process.env, ASK_HOME: askHome, ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"]
   });
   let stdout = "";

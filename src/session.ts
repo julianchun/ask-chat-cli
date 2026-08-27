@@ -986,10 +986,10 @@ async function reclaimLegacyReclaimGuardDirectory(
 
   for (const marker of observedMarkers) {
     if (!marker.observed) {
-      if (Date.now() - directoryStat.mtimeMs < SESSION_LOCK_MALFORMED_GRACE_MS) {
-        return false;
-      }
-      continue;
+      // A marker that cannot be read or statted may still belong to a live
+      // legacy owner. Never turn a transient Windows filesystem error into
+      // permission to unlink it and take over the guard.
+      return false;
     }
     if (
       marker.observed.pid !== undefined &&
