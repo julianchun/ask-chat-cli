@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createExecutionQueue } from "../src/execution-queue";
 
 interface Worker {
   child: WorkerChild;
@@ -93,8 +94,12 @@ describe("execution queue across processes", () => {
 
     waiting.child.kill("SIGTERM");
     await waiting.completed;
+    const observer = createExecutionQueue(
+      { ASK_HOME: askHome } as NodeJS.ProcessEnv,
+      { handleSignals: false }
+    );
     await vi.waitFor(async () => {
-      await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 0 });
+      await expect(observer.inspect()).resolves.toEqual({ active: 4, queued: 0 });
     }, { timeout: 5_000, interval: 25 });
   }, 10_000);
 

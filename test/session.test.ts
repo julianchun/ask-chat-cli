@@ -131,8 +131,15 @@ describe("session ownership helpers", () => {
       await originalRename(oldPath, newPath);
     });
 
-    const writing = writeProfileMarker(env, { timeoutMs: 100 });
-    await renameStarted;
+    const writing = writeProfileMarker(env, { timeoutMs: 1_000 });
+    const writingSettled = writing.then(
+      () => "write-settled" as const,
+      () => "write-settled" as const
+    );
+    await expect(Promise.race([
+      renameStarted.then(() => "rename-started" as const),
+      writingSettled
+    ])).resolves.toBe("rename-started");
     await expect(writing).rejects.toThrow("Timed out writing");
     await expect(fs.promises.access(markerPath)).rejects.toThrow();
 
@@ -177,8 +184,15 @@ describe("session ownership helpers", () => {
       chromePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
       headless: false,
       generation: "late-state-generation"
-    }, { timeoutMs: 100 });
-    await renameStarted;
+    }, { timeoutMs: 1_000 });
+    const writingSettled = writing.then(
+      () => "write-settled" as const,
+      () => "write-settled" as const
+    );
+    await expect(Promise.race([
+      renameStarted.then(() => "rename-started" as const),
+      writingSettled
+    ])).resolves.toBe("rename-started");
     await expect(writing).rejects.toThrow("Timed out persisting");
     await expect(readSessionState(env)).resolves.toBeUndefined();
 

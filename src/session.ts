@@ -1597,11 +1597,11 @@ export async function getProcessInfo(pid: number): Promise<ProcessInfo | undefin
       creationTime: await getCurrentProcessCreationTime()
     };
   }
-  if (process.platform === "win32") {
-    return getWindowsProcessInfo(pid);
-  }
   if (!isProcessAlive(pid)) {
     return undefined;
+  }
+  if (process.platform === "win32") {
+    return getWindowsProcessInfo(pid);
   }
   if (process.platform === "linux") {
     const linuxInfo = await getLinuxProcessInfo(pid);
