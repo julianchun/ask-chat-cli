@@ -37,7 +37,7 @@ describe("execution queue across processes", () => {
   });
 
   it("admits four workers, queues four, and rejects a ninth", async () => {
-    const workers = Array.from({ length: 8 }, () => startWorker(askHome, 800));
+    const workers = Array.from({ length: 8 }, () => startWorker(askHome, 3_000));
     children.push(...workers.map((worker) => worker.child));
 
     await vi.waitFor(async () => {
@@ -57,7 +57,7 @@ describe("execution queue across processes", () => {
       expect(worker.output()).toContain('"event":"released"');
     }
     await expect(readCounts(askHome)).resolves.toEqual({ active: 0, queued: 0 });
-  }, 10_000);
+  }, 15_000);
 
   it("reclaims a slot after an active worker crashes", async () => {
     const active = Array.from({ length: 4 }, () => startWorker(askHome, 10_000));

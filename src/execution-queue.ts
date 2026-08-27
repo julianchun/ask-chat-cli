@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getAskHome } from "./config";
 import type { ProviderName } from "./providers";
-import { getProcessInfo, isProcessAlive, type ProcessInfo } from "./session";
+import { getProcessInfo, type ProcessInfo } from "./session";
 
 export const MAX_ACTIVE_EXECUTIONS = 4;
 export const MAX_QUEUED_EXECUTIONS = 4;
@@ -14,6 +14,7 @@ const DEFAULT_POLL_MS = 250;
 const PROCESS_RECHECK_MS = 2_000;
 const STATE_LOCK_TIMEOUT_MS = 2_000;
 const STALE_STATE_LOCK_MS = 30_000;
+const STATE_LOCK_RELEASE_TIMEOUT_MS = 500;
 
 interface ExecutionEntry {
   id: string;
@@ -555,10 +556,10 @@ async function removeDeadEntries(
   inspectProcess: (pid: number) => Promise<ProcessInfo | undefined>
 ): Promise<void> {
   const entries = [...state.active, ...state.queued, ...state.guards];
-  // Windows process inspection starts PowerShell/WMI for non-current PIDs.
   // Inspect stale entries concurrently so one dead queued worker cannot make
   // cleanup exceed the queue poll deadline while unrelated active workers are
-  // checked serially.
+  // checked serially. getProcessInfo returns a minimal PID-only record when
+  // metadata inspection is unavailable, so undefined means the owner is gone.
   const inspected = await Promise.all(entries.map(async (entry) => {
     if (currentTime - entry.processCheckedAt < PROCESS_RECHECK_MS) {
       return { entry, processInfo: true as const };
@@ -572,15 +573,6 @@ async function removeDeadEntries(
       continue;
     }
     if (!processInfo) {
-      // A process-table query can fail transiently (notably while Windows
-      // PowerShell/WMI is starting). Do not treat missing metadata as proof
-      // that a worker is dead: retaining a live entry is fail-closed for
-      // admission and avoids dispatching a duplicate execution. A later
-      // refresh can still remove it once the PID is no longer alive.
-      if (isProcessAlive(entry.pid)) {
-        entry.processCheckedAt = currentTime;
-        alive.push(entry);
-      }
       continue;
     }
     if (
@@ -635,26 +627,43 @@ async function withStateLock<T>(env: NodeJS.ProcessEnv, now: () => number, fn: (
   let handle: fs.promises.FileHandle | undefined;
 
   while (!handle) {
+    let candidateHandle: fs.promises.FileHandle;
     try {
-      handle = await fs.promises.open(lockPath, "wx");
-      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+      candidateHandle = await fs.promises.open(lockPath, "wx");
     } catch (error) {
-      if (!isFileExistsError(error)) {
+      if (!isStateLockContentionError(error)) {
         throw error;
       }
       try {
         const stat = await fs.promises.stat(lockPath);
         if (now() - stat.mtimeMs > STALE_STATE_LOCK_MS) {
-          await fs.promises.rm(lockPath, { force: true });
+          await removeStateLockFile(lockPath);
           continue;
         }
-      } catch {
+      } catch (inspectionError) {
+        if (!isMissingFileError(inspectionError) && !isStateLockContentionError(inspectionError)) {
+          throw inspectionError;
+        }
+        if (now() >= deadline) {
+          throw new Error("ask: timed out waiting to update execution queue state");
+        }
+        await delay(25);
         continue;
       }
       if (now() >= deadline) {
         throw new Error("ask: timed out waiting to update execution queue state");
       }
       await delay(25);
+      continue;
+    }
+
+    try {
+      await candidateHandle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+      handle = candidateHandle;
+    } catch (error) {
+      await candidateHandle.close().catch(() => undefined);
+      await removeStateLockFile(lockPath).catch(() => undefined);
+      throw error;
     }
   }
 
@@ -662,12 +671,44 @@ async function withStateLock<T>(env: NodeJS.ProcessEnv, now: () => number, fn: (
     return await fn();
   } finally {
     await handle.close().catch(() => undefined);
-    await fs.promises.rm(lockPath, { force: true }).catch(() => undefined);
+    await removeStateLockFile(lockPath);
   }
 }
 
 function isFileExistsError(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
+}
+
+function isStateLockContentionError(error: unknown): boolean {
+  if (isFileExistsError(error)) {
+    return true;
+  }
+  if (process.platform !== "win32" || !error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+  return error.code === "EPERM" || error.code === "EACCES" || error.code === "EBUSY";
+}
+
+async function removeStateLockFile(lockPath: string): Promise<void> {
+  const deadlineAt = Date.now() + STATE_LOCK_RELEASE_TIMEOUT_MS;
+  while (true) {
+    try {
+      await fs.promises.unlink(lockPath);
+      return;
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return;
+      }
+      if (!isStateLockContentionError(error) || Date.now() >= deadlineAt) {
+        throw error;
+      }
+      await delay(10);
+    }
+  }
 }
 
 function delay(ms: number): Promise<void> {

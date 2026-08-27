@@ -297,7 +297,7 @@ describe("execution queue", () => {
       "utf8"
     );
     const queue = createExecutionQueue(env, {
-      getProcessInfo: async () => undefined
+      getProcessInfo: async (pid) => ({ pid })
     });
 
     await expect(queue.inspect()).resolves.toEqual({ active: 1, queued: 0 });

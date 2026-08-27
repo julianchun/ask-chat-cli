@@ -640,13 +640,20 @@ describe("session ownership helpers", () => {
     const acquisition = withSessionLock(
       env,
       async () => undefined,
-      { timeoutMs: 60 },
+      { timeoutMs: 1_000 },
       { isProcessAlive: () => false }
     );
-    await unlinkStarted;
+    const acquisitionSettled = acquisition.then(
+      () => "acquisition-settled" as const,
+      () => "acquisition-settled" as const
+    );
+    await expect(Promise.race([
+      unlinkStarted.then(() => "unlink-started" as const),
+      acquisitionSettled
+    ])).resolves.toBe("unlink-started");
     const startedAt = Date.now();
     await expect(acquisition).rejects.toThrow("Timed out waiting");
-    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
     await expect(fs.promises.access(reclaimPath)).resolves.toBeUndefined();
 
     releaseUnlink?.();

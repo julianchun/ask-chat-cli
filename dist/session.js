@@ -694,10 +694,13 @@ async function reclaimLegacyReclaimGuardDirectory(reclaimPath, deadlineAt, depen
         }
         return isMissingFileError(error);
     }
+    // A legacy owner may be between mkdir and marker publication, or Windows
+    // may expose the directory before its marker is immediately readable. Never
+    // reclaim a newly created directory guard regardless of partial evidence.
+    if (Date.now() - directoryStat.mtimeMs < SESSION_LOCK_MALFORMED_GRACE_MS) {
+        return false;
+    }
     if (markerNames.length === 0) {
-        if (Date.now() - directoryStat.mtimeMs < SESSION_LOCK_MALFORMED_GRACE_MS) {
-            return false;
-        }
         try {
             await raceWithDeadline(node_fs_1.default.promises.rmdir(reclaimPath), deadlineAt, SESSION_LOCK_TIMEOUT_MESSAGE);
             return true;
@@ -1222,7 +1225,16 @@ async function getProcessInfo(pid) {
         return undefined;
     }
     if (process.platform === "win32") {
-        return getWindowsProcessInfo(pid);
+        const inspection = await inspectWindowsProcessInfo(pid);
+        if (inspection.status === "found") {
+            return inspection.info;
+        }
+        if (inspection.status === "absent") {
+            return undefined;
+        }
+        // A PowerShell/WMI startup failure is not evidence that a live owner is
+        // gone. Return a minimal record so queue admission remains fail-closed.
+        return isProcessAlive(pid) ? { pid } : undefined;
     }
     if (process.platform === "linux") {
         const linuxInfo = await getLinuxProcessInfo(pid);
@@ -1534,6 +1546,10 @@ async function getLinuxPortOwnerProcessInfo(port) {
     return undefined;
 }
 async function getWindowsProcessInfo(pid, timeoutMs = WINDOWS_PROCESS_INFO_TIMEOUT_MS) {
+    const inspection = await inspectWindowsProcessInfo(pid, timeoutMs);
+    return inspection.status === "found" ? inspection.info : undefined;
+}
+async function inspectWindowsProcessInfo(pid, timeoutMs = WINDOWS_PROCESS_INFO_TIMEOUT_MS) {
     try {
         const { stdout } = await execFileAsync("powershell.exe", [
             "-NoProfile",
@@ -1542,23 +1558,26 @@ async function getWindowsProcessInfo(pid, timeoutMs = WINDOWS_PROCESS_INFO_TIMEO
         ], { timeout: timeoutMs, windowsHide: true });
         const trimmed = String(stdout).trim();
         if (!trimmed) {
-            return undefined;
+            return { status: "absent" };
         }
         const parsed = JSON.parse(trimmed);
         if (!parsed || typeof parsed !== "object") {
-            return undefined;
+            return { status: "unavailable" };
         }
         const value = parsed;
         return {
-            pid,
-            name: typeof value.Name === "string" ? value.Name : undefined,
-            commandLine: typeof value.CommandLine === "string" ? value.CommandLine : undefined,
-            creationTime: typeof value.CreationDate === "string" ? value.CreationDate : undefined,
-            executablePath: typeof value.ExecutablePath === "string" ? value.ExecutablePath : undefined
+            status: "found",
+            info: {
+                pid,
+                name: typeof value.Name === "string" ? value.Name : undefined,
+                commandLine: typeof value.CommandLine === "string" ? value.CommandLine : undefined,
+                creationTime: typeof value.CreationDate === "string" ? value.CreationDate : undefined,
+                executablePath: typeof value.ExecutablePath === "string" ? value.ExecutablePath : undefined
+            }
         };
     }
     catch {
-        return undefined;
+        return { status: "unavailable" };
     }
 }
 async function classifySession(env, port, debuggingConnected, dependencies = {}) {
