@@ -203,7 +203,8 @@ interface SessionLockContext {
 }
 
 const sessionLockContext = new AsyncLocalStorage<SessionLockContext>();
-let currentProcessCreationTime: Promise<string | undefined> | undefined;
+let currentProcessCreationTimeLookup: Promise<string | undefined> | undefined;
+let currentProcessCreationTimeValue: string | undefined;
 
 /**
  * Keep the currently held lifecycle lock published until an already-started,
@@ -1105,14 +1106,21 @@ async function isLockOwnerAlive(
 }
 
 function getCurrentProcessCreationTime(): Promise<string | undefined> {
-  // Windows process-table queries can be slow to start under CI. Keep the
-  // creation-time evidence when it is available, but bound this optional
-  // lookup so ordinary lock acquisition never waits on WMI indefinitely. An
-  // absent value is handled conservatively as PID-only liveness.
-  currentProcessCreationTime ??= process.platform === "win32"
-    ? getWindowsProcessInfo(process.pid, 1_500).then((info) => info?.creationTime)
-    : getProcessCreationTime(process.pid);
-  return currentProcessCreationTime;
+  if (process.platform !== "win32") {
+    currentProcessCreationTimeLookup ??= getProcessCreationTime(process.pid);
+    return currentProcessCreationTimeLookup;
+  }
+
+  // WMI startup can consume most of a short lifecycle deadline on Windows,
+  // especially when several CLI/test processes start together. Warm this
+  // optional PID-generation evidence in the background and use it once ready;
+  // until then, lock liveness remains conservatively PID-based.
+  currentProcessCreationTimeLookup ??= getWindowsProcessInfo(process.pid)
+    .then((info) => {
+      currentProcessCreationTimeValue = info?.creationTime;
+      return currentProcessCreationTimeValue;
+    });
+  return Promise.resolve(currentProcessCreationTimeValue);
 }
 
 interface OwnedLockReleaseResult {
@@ -1690,13 +1698,12 @@ export async function getPortOwnerProcessInfo(port: number): Promise<ProcessInfo
   }
   if (process.platform === "win32") {
     try {
-      const { stdout } = await execFileAsync("powershell.exe", [
-        "-NoProfile",
-        "-Command",
-        `(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)`
-      ]);
-      const pid = Number(stdout.trim());
-      return Number.isInteger(pid) && pid > 0 ? getProcessInfo(pid) : undefined;
+      const { stdout } = await execFileAsync("netstat.exe", ["-ano", "-p", "tcp"], {
+        timeout: WINDOWS_PROCESS_INFO_TIMEOUT_MS,
+        windowsHide: true
+      });
+      const pid = parseWindowsNetstatPortOwnerPid(String(stdout), port);
+      return pid === undefined ? undefined : getProcessInfo(pid);
     } catch {
       return undefined;
     }
@@ -1709,6 +1716,41 @@ export async function getPortOwnerProcessInfo(port: number): Promise<ProcessInfo
   } catch {
     return process.platform === "linux" ? getLinuxPortOwnerProcessInfo(port) : undefined;
   }
+}
+
+/** Parse native Windows netstat output without depending on localized state labels. */
+export function parseWindowsNetstatPortOwnerPid(output: string, port: number): number | undefined {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    return undefined;
+  }
+  for (const line of output.split(/\r?\n/)) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 5 || fields[0]?.toUpperCase() !== "TCP") {
+      continue;
+    }
+    const localPort = parseEndpointPort(fields[1]);
+    const remotePort = parseEndpointPort(fields[2]);
+    const state = fields[3]?.toUpperCase();
+    const pid = Number(fields.at(-1));
+    if (
+      localPort === port &&
+      (remotePort === 0 || state === "LISTENING") &&
+      Number.isInteger(pid) &&
+      pid > 0
+    ) {
+      return pid;
+    }
+  }
+  return undefined;
+}
+
+function parseEndpointPort(endpoint: string | undefined): number | undefined {
+  const match = /:(\d+)$/.exec(endpoint || "");
+  if (!match) {
+    return undefined;
+  }
+  const value = Number(match[1]);
+  return Number.isInteger(value) && value >= 0 && value <= 65535 ? value : undefined;
 }
 
 /**
@@ -1914,7 +1956,7 @@ async function getWindowsProcessInfo(
       "-NoProfile",
       "-Command",
       `Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" | ConvertTo-Json -Compress`
-    ], { timeout: timeoutMs });
+    ], { timeout: timeoutMs, windowsHide: true });
     const trimmed = String(stdout).trim();
     if (!trimmed) {
       return undefined;

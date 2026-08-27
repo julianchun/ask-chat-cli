@@ -22,6 +22,7 @@ exports.writeSessionState = writeSessionState;
 exports.isProcessAlive = isProcessAlive;
 exports.getProcessInfo = getProcessInfo;
 exports.getPortOwnerProcessInfo = getPortOwnerProcessInfo;
+exports.parseWindowsNetstatPortOwnerPid = parseWindowsNetstatPortOwnerPid;
 exports.getChromeBrowserProcessesUsingProfile = getChromeBrowserProcessesUsingProfile;
 exports.classifySession = classifySession;
 exports.processMatchesAskSession = processMatchesAskSession;
@@ -124,7 +125,8 @@ const SESSION_LOCK_WAIT_MS = 35_000;
 const SESSION_LOCK_MALFORMED_GRACE_MS = 250;
 const SESSION_LOCK_TIMEOUT_MESSAGE = "Timed out waiting for another ask Chrome session operation to finish.";
 const sessionLockContext = new node_async_hooks_1.AsyncLocalStorage();
-let currentProcessCreationTime;
+let currentProcessCreationTimeLookup;
+let currentProcessCreationTimeValue;
 /**
  * Keep the currently held lifecycle lock published until an already-started,
  * non-cancellable canonical filesystem mutation has settled. Callers still
@@ -821,14 +823,20 @@ async function isLockOwnerAlive(observed, deadlineAt, dependencies = {}) {
     return actualCreationTime === undefined || actualCreationTime === observed.processCreationTime;
 }
 function getCurrentProcessCreationTime() {
-    // Windows process-table queries can be slow to start under CI. Keep the
-    // creation-time evidence when it is available, but bound this optional
-    // lookup so ordinary lock acquisition never waits on WMI indefinitely. An
-    // absent value is handled conservatively as PID-only liveness.
-    currentProcessCreationTime ??= process.platform === "win32"
-        ? getWindowsProcessInfo(process.pid, 1_500).then((info) => info?.creationTime)
-        : getProcessCreationTime(process.pid);
-    return currentProcessCreationTime;
+    if (process.platform !== "win32") {
+        currentProcessCreationTimeLookup ??= getProcessCreationTime(process.pid);
+        return currentProcessCreationTimeLookup;
+    }
+    // WMI startup can consume most of a short lifecycle deadline on Windows,
+    // especially when several CLI/test processes start together. Warm this
+    // optional PID-generation evidence in the background and use it once ready;
+    // until then, lock liveness remains conservatively PID-based.
+    currentProcessCreationTimeLookup ??= getWindowsProcessInfo(process.pid)
+        .then((info) => {
+        currentProcessCreationTimeValue = info?.creationTime;
+        return currentProcessCreationTimeValue;
+    });
+    return Promise.resolve(currentProcessCreationTimeValue);
 }
 async function releaseOwnedLock(lockPath, ownerPath, token) {
     let lockHandle;
@@ -1306,13 +1314,12 @@ async function getPortOwnerProcessInfo(port) {
     }
     if (process.platform === "win32") {
         try {
-            const { stdout } = await execFileAsync("powershell.exe", [
-                "-NoProfile",
-                "-Command",
-                `(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)`
-            ]);
-            const pid = Number(stdout.trim());
-            return Number.isInteger(pid) && pid > 0 ? getProcessInfo(pid) : undefined;
+            const { stdout } = await execFileAsync("netstat.exe", ["-ano", "-p", "tcp"], {
+                timeout: WINDOWS_PROCESS_INFO_TIMEOUT_MS,
+                windowsHide: true
+            });
+            const pid = parseWindowsNetstatPortOwnerPid(String(stdout), port);
+            return pid === undefined ? undefined : getProcessInfo(pid);
         }
         catch {
             return undefined;
@@ -1326,6 +1333,37 @@ async function getPortOwnerProcessInfo(port) {
     catch {
         return process.platform === "linux" ? getLinuxPortOwnerProcessInfo(port) : undefined;
     }
+}
+/** Parse native Windows netstat output without depending on localized state labels. */
+function parseWindowsNetstatPortOwnerPid(output, port) {
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+        return undefined;
+    }
+    for (const line of output.split(/\r?\n/)) {
+        const fields = line.trim().split(/\s+/);
+        if (fields.length < 5 || fields[0]?.toUpperCase() !== "TCP") {
+            continue;
+        }
+        const localPort = parseEndpointPort(fields[1]);
+        const remotePort = parseEndpointPort(fields[2]);
+        const state = fields[3]?.toUpperCase();
+        const pid = Number(fields.at(-1));
+        if (localPort === port &&
+            (remotePort === 0 || state === "LISTENING") &&
+            Number.isInteger(pid) &&
+            pid > 0) {
+            return pid;
+        }
+    }
+    return undefined;
+}
+function parseEndpointPort(endpoint) {
+    const match = /:(\d+)$/.exec(endpoint || "");
+    if (!match) {
+        return undefined;
+    }
+    const value = Number(match[1]);
+    return Number.isInteger(value) && value >= 0 && value <= 65535 ? value : undefined;
 }
 /**
  * Return the top-level Chrome browser processes that explicitly claim this
@@ -1506,7 +1544,7 @@ async function getWindowsProcessInfo(pid, timeoutMs = WINDOWS_PROCESS_INFO_TIMEO
             "-NoProfile",
             "-Command",
             `Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" | ConvertTo-Json -Compress`
-        ], { timeout: timeoutMs });
+        ], { timeout: timeoutMs, windowsHide: true });
         const trimmed = String(stdout).trim();
         if (!trimmed) {
             return undefined;

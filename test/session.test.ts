@@ -10,12 +10,35 @@ import {
   getSessionStatePath,
   hasProfileMarker,
   normalizePathForCompare,
+  parseWindowsNetstatPortOwnerPid,
   processMatchesAskSession,
   readSessionState,
   withSessionLock,
   writeProfileMarker,
   writeSessionState
 } from "../src/session";
+
+describe("Windows port ownership parsing", () => {
+  it("finds IPv4 and IPv6 listeners without relying on localized state text", () => {
+    const output = [
+      "Active Connections",
+      "",
+      "  Proto  Local Address          Foreign Address        State           PID",
+      "  TCP    127.0.0.1:9444         127.0.0.1:51000        ESTABLISHED     111",
+      "  TCP    0.0.0.0:9555           0.0.0.0:0              SOME-LANGUAGE   222",
+      "  TCP    [::1]:9666             [::]:0                 LISTENING       333"
+    ].join("\r\n");
+
+    expect(parseWindowsNetstatPortOwnerPid(output, 9444)).toBeUndefined();
+    expect(parseWindowsNetstatPortOwnerPid(output, 9555)).toBe(222);
+    expect(parseWindowsNetstatPortOwnerPid(output, 9666)).toBe(333);
+  });
+
+  it("rejects invalid ports and malformed PIDs", () => {
+    expect(parseWindowsNetstatPortOwnerPid("TCP 0.0.0.0:9222 0.0.0.0:0 LISTENING nope", 9222)).toBeUndefined();
+    expect(parseWindowsNetstatPortOwnerPid("TCP 0.0.0.0:9222 0.0.0.0:0 LISTENING 123", 0)).toBeUndefined();
+  });
+});
 
 describe("session ownership helpers", () => {
   let tempDir: string;
