@@ -359,7 +359,8 @@ async function prepareWithOneRecovery(page, adapter, options, deadline, initialC
             return { baseline, dispatch };
         }
         catch (error) {
-            if (recoveryAttempts >= 1 ||
+            if (isCommandDeadlineFailure(error) ||
+                recoveryAttempts >= 1 ||
                 !isRecoverablePreSubmitFailure(error) ||
                 deadline.remainingMs() <= 0) {
                 if (deadline.remainingMs() <= 0) {
@@ -404,6 +405,9 @@ async function prepareWithOneRecovery(page, adapter, options, deadline, initialC
             onCapabilities(capabilities);
         }
     }
+}
+function isCommandDeadlineFailure(error) {
+    return error instanceof errors_1.AskFailure && error.cause instanceof DeadlineExceededError;
 }
 function isRecoverablePreSubmitFailure(error) {
     return !(error instanceof errors_1.AskFailure) || error.retryable;

@@ -767,6 +767,7 @@ async function prepareWithOneRecovery(
       return { baseline, dispatch };
     } catch (error) {
       if (
+        isCommandDeadlineFailure(error) ||
         recoveryAttempts >= 1 ||
         !isRecoverablePreSubmitFailure(error) ||
         deadline.remainingMs() <= 0
@@ -832,6 +833,10 @@ async function prepareWithOneRecovery(
       onCapabilities(capabilities);
     }
   }
+}
+
+function isCommandDeadlineFailure(error: unknown): boolean {
+  return error instanceof AskFailure && error.cause instanceof DeadlineExceededError;
 }
 
 function isRecoverablePreSubmitFailure(error: unknown): boolean {

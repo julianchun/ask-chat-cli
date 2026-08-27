@@ -411,6 +411,7 @@ describe("provider coordinator deadline", () => {
     const page = new FixturePage();
     const adapter = coordinatorFixtureAdapter();
     let dispatchCount = 0;
+    let recoveryCount = 0;
     adapter.preselectDispatch = async () => ({
       name: "fixture.send",
       kind: "click",
@@ -437,11 +438,15 @@ describe("provider coordinator deadline", () => {
     await expect(executeProviderPrompt(page as unknown as Page, adapter, {
       prompt: "bounded",
       attachments: [],
-      timeoutMs: 20
+      timeoutMs: 20,
+      onPreSubmitRecovery: () => {
+        recoveryCount += 1;
+      }
     })).rejects.toMatchObject({ code, stage });
 
     expect(Date.now() - startedAt).toBeLessThan(250);
     expect(dispatchCount).toBe(0);
+    expect(recoveryCount).toBe(0);
   });
 
   it("bounds a hanging dispatched action and enters observe-only unknown state", async () => {

@@ -126,7 +126,6 @@ const SESSION_LOCK_MALFORMED_GRACE_MS = 250;
 const SESSION_LOCK_TIMEOUT_MESSAGE = "Timed out waiting for another ask Chrome session operation to finish.";
 const sessionLockContext = new node_async_hooks_1.AsyncLocalStorage();
 let currentProcessCreationTimeLookup;
-let currentProcessCreationTimeValue;
 /**
  * Keep the currently held lifecycle lock published until an already-started,
  * non-cancellable canonical filesystem mutation has settled. Callers still
@@ -823,20 +822,16 @@ async function isLockOwnerAlive(observed, deadlineAt, dependencies = {}) {
     return actualCreationTime === undefined || actualCreationTime === observed.processCreationTime;
 }
 function getCurrentProcessCreationTime() {
-    if (process.platform !== "win32") {
-        currentProcessCreationTimeLookup ??= getProcessCreationTime(process.pid);
-        return currentProcessCreationTimeLookup;
+    if (process.platform === "win32") {
+        // Node does not expose the current Windows process creation timestamp.
+        // Starting PowerShell here makes every queue/lock admission contend on WMI
+        // when several CLI processes launch together. Omit this optional evidence;
+        // token-checked ownership remains exact, and PID-only liveness fails closed
+        // until a potentially reused live PID exits.
+        return Promise.resolve(undefined);
     }
-    // WMI startup can consume most of a short lifecycle deadline on Windows,
-    // especially when several CLI/test processes start together. Warm this
-    // optional PID-generation evidence in the background and use it once ready;
-    // until then, lock liveness remains conservatively PID-based.
-    currentProcessCreationTimeLookup ??= getWindowsProcessInfo(process.pid)
-        .then((info) => {
-        currentProcessCreationTimeValue = info?.creationTime;
-        return currentProcessCreationTimeValue;
-    });
-    return Promise.resolve(currentProcessCreationTimeValue);
+    currentProcessCreationTimeLookup ??= getProcessCreationTime(process.pid);
+    return currentProcessCreationTimeLookup;
 }
 async function releaseOwnedLock(lockPath, ownerPath, token) {
     let lockHandle;

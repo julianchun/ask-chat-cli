@@ -204,7 +204,6 @@ interface SessionLockContext {
 
 const sessionLockContext = new AsyncLocalStorage<SessionLockContext>();
 let currentProcessCreationTimeLookup: Promise<string | undefined> | undefined;
-let currentProcessCreationTimeValue: string | undefined;
 
 /**
  * Keep the currently held lifecycle lock published until an already-started,
@@ -1106,21 +1105,16 @@ async function isLockOwnerAlive(
 }
 
 function getCurrentProcessCreationTime(): Promise<string | undefined> {
-  if (process.platform !== "win32") {
-    currentProcessCreationTimeLookup ??= getProcessCreationTime(process.pid);
-    return currentProcessCreationTimeLookup;
+  if (process.platform === "win32") {
+    // Node does not expose the current Windows process creation timestamp.
+    // Starting PowerShell here makes every queue/lock admission contend on WMI
+    // when several CLI processes launch together. Omit this optional evidence;
+    // token-checked ownership remains exact, and PID-only liveness fails closed
+    // until a potentially reused live PID exits.
+    return Promise.resolve(undefined);
   }
-
-  // WMI startup can consume most of a short lifecycle deadline on Windows,
-  // especially when several CLI/test processes start together. Warm this
-  // optional PID-generation evidence in the background and use it once ready;
-  // until then, lock liveness remains conservatively PID-based.
-  currentProcessCreationTimeLookup ??= getWindowsProcessInfo(process.pid)
-    .then((info) => {
-      currentProcessCreationTimeValue = info?.creationTime;
-      return currentProcessCreationTimeValue;
-    });
-  return Promise.resolve(currentProcessCreationTimeValue);
+  currentProcessCreationTimeLookup ??= getProcessCreationTime(process.pid);
+  return currentProcessCreationTimeLookup;
 }
 
 interface OwnedLockReleaseResult {
