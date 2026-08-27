@@ -18,7 +18,12 @@ describe("execution queue", () => {
   });
 
   afterEach(async () => {
-    await fs.promises.rm(askHome, { recursive: true, force: true });
+    await fs.promises.rm(askHome, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25
+    });
   });
 
   function makeQueue(options: Parameters<typeof createExecutionQueue>[1] = {}) {

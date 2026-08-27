@@ -51,7 +51,12 @@ describe("session ownership helpers", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
-    await fs.promises.rm(tempDir, { recursive: true, force: true });
+    await fs.promises.rm(tempDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25
+    });
   });
 
   it("writes non-secret session state and profile marker", async () => {

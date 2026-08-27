@@ -33,7 +33,12 @@ describe("execution queue across processes", () => {
       child.kill("SIGKILL");
     })));
     children.length = 0;
-    await fs.promises.rm(askHome, { recursive: true, force: true });
+    await fs.promises.rm(askHome, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25
+    });
   });
 
   it("admits four workers, queues four, and rejects a ninth", async () => {
