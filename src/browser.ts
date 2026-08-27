@@ -261,7 +261,7 @@ export function getChromeCandidates(
     const home = env.HOME || os.homedir();
     candidates = [
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      path.join(home, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+      path.posix.join(home, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
       ...fromPath(["google-chrome", "Google Chrome"])
     ];
   } else {
@@ -289,25 +289,31 @@ export function resolveChromePath(
   exists: (filePath: string) => boolean = fs.existsSync,
   platform?: NodeJS.Platform
 ): string {
+  const resolvedPlatform = platform || inferChromePlatform(env);
   if (env.ASK_CHROME_PATH !== undefined) {
     const configuredPath = env.ASK_CHROME_PATH;
     if (!configuredPath.trim()) {
       throw new Error("ASK_CHROME_PATH is set but empty. Point it to the Google Chrome executable.");
     }
-    if (!isChromeExecutablePath(configuredPath, exists)) {
+    if (!isChromeExecutablePath(configuredPath, exists, resolvedPlatform)) {
       throw new Error(`ASK_CHROME_PATH does not point to a file: ${configuredPath}`);
     }
     return configuredPath;
   }
 
-  const match = getChromeCandidates(env, platform).find((candidate) => isChromeExecutablePath(candidate, exists));
+  const match = getChromeCandidates(env, resolvedPlatform)
+    .find((candidate) => isChromeExecutablePath(candidate, exists, resolvedPlatform));
   if (!match) {
     throw new Error("Google Chrome was not found. Set ASK_CHROME_PATH to the Google Chrome executable.");
   }
   return match;
 }
 
-function isChromeExecutablePath(filePath: string, exists: (filePath: string) => boolean): boolean {
+function isChromeExecutablePath(
+  filePath: string,
+  exists: (filePath: string) => boolean,
+  platform: NodeJS.Platform = process.platform
+): boolean {
   if (!exists(filePath)) {
     return false;
   }
@@ -316,6 +322,12 @@ function isChromeExecutablePath(filePath: string, exists: (filePath: string) => 
   }
   try {
     if (!fs.statSync(filePath).isFile()) {
+      return false;
+    }
+    // Windows does not implement POSIX execute bits: X_OK succeeds for any
+    // regular file. Chrome's native executable is an .exe, so reject an
+    // arbitrary text/script file before attempting to spawn it.
+    if (platform === "win32" && path.win32.extname(filePath).toLowerCase() !== ".exe") {
       return false;
     }
     fs.accessSync(filePath, fs.constants.X_OK);
@@ -1738,7 +1750,10 @@ export async function inspectChromeSession(options: ChromeLaunchOptions = {}): P
   }
   const candidatePort = selection.portPolicy === "pinned"
     ? selection.port
-    : prefetchedVersion ? activePort : state?.port ?? activePort;
+    // A stale DevToolsActivePort file is not an assigned managed endpoint on
+    // its own. Only expose a fresh reachable endpoint or a port persisted in
+    // session.json; otherwise status should continue to report "port auto".
+    : prefetchedVersion ? activePort : state?.port;
   if (candidatePort === undefined) {
     return {
       portPolicy: selection.portPolicy,

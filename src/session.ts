@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { getAskHome, getChromeProfileDir, joinConfiguredPath } from "./config";
 
 const execFileAsync = promisify(execFile);
+const WINDOWS_PROCESS_INFO_TIMEOUT_MS = 1_500;
 
 export const SESSION_STATE_VERSION = 1;
 
@@ -1104,7 +1105,13 @@ async function isLockOwnerAlive(
 }
 
 function getCurrentProcessCreationTime(): Promise<string | undefined> {
-  currentProcessCreationTime ??= getProcessCreationTime(process.pid);
+  // Windows process-table queries can be slow to start under CI. Keep the
+  // creation-time evidence when it is available, but bound this optional
+  // lookup so ordinary lock acquisition never waits on WMI indefinitely. An
+  // absent value is handled conservatively as PID-only liveness.
+  currentProcessCreationTime ??= process.platform === "win32"
+    ? getWindowsProcessInfo(process.pid, 1_500).then((info) => info?.creationTime)
+    : getProcessCreationTime(process.pid);
   return currentProcessCreationTime;
 }
 
@@ -1573,6 +1580,21 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 export async function getProcessInfo(pid: number): Promise<ProcessInfo | undefined> {
+  // Process-table queries through PowerShell/WMI are comparatively expensive
+  // on Windows. We already have complete, trustworthy argv information for
+  // this process, so avoid starting a PowerShell child for every queue
+  // admission and state refresh.
+  if (pid === process.pid) {
+    const args = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+    return {
+      pid,
+      args,
+      commandLine: args.map(formatCommandLineArgument).join(" "),
+      executablePath: process.execPath,
+      name: path.basename(process.execPath),
+      creationTime: await getCurrentProcessCreationTime()
+    };
+  }
   if (process.platform === "win32") {
     return getWindowsProcessInfo(pid);
   }
@@ -1883,14 +1905,17 @@ async function getLinuxPortOwnerProcessInfo(port: number): Promise<ProcessInfo |
   return undefined;
 }
 
-async function getWindowsProcessInfo(pid: number): Promise<ProcessInfo | undefined> {
+async function getWindowsProcessInfo(
+  pid: number,
+  timeoutMs = WINDOWS_PROCESS_INFO_TIMEOUT_MS
+): Promise<ProcessInfo | undefined> {
   try {
     const { stdout } = await execFileAsync("powershell.exe", [
       "-NoProfile",
       "-Command",
       `Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" | ConvertTo-Json -Compress`
-    ]);
-    const trimmed = stdout.trim();
+    ], { timeout: timeoutMs });
+    const trimmed = String(stdout).trim();
     if (!trimmed) {
       return undefined;
     }

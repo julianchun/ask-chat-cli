@@ -286,6 +286,23 @@ describe("execution queue", () => {
     await expect(queue.inspect()).resolves.toEqual({ active: 0, queued: 0 });
   });
 
+  it("retains a live entry when process metadata is temporarily unavailable", async () => {
+    await fs.promises.writeFile(
+      getExecutionStatePath(env),
+      JSON.stringify({
+        version: 1,
+        active: [entry("live-but-uninspectable", process.pid)],
+        queued: []
+      }),
+      "utf8"
+    );
+    const queue = createExecutionQueue(env, {
+      getProcessInfo: async () => undefined
+    });
+
+    await expect(queue.inspect()).resolves.toEqual({ active: 1, queued: 0 });
+  });
+
   it("releases a lease idempotently", async () => {
     const queue = makeQueue();
     const lease: ExecutionLease = await queue.acquire({ provider: "chatgpt" });

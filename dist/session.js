@@ -35,6 +35,7 @@ const node_async_hooks_1 = require("node:async_hooks");
 const node_util_1 = require("node:util");
 const config_1 = require("./config");
 const execFileAsync = (0, node_util_1.promisify)(node_child_process_1.execFile);
+const WINDOWS_PROCESS_INFO_TIMEOUT_MS = 1_500;
 exports.SESSION_STATE_VERSION = 1;
 class DeadlineExceededError extends Error {
     code = "DEADLINE_EXCEEDED";
@@ -820,7 +821,13 @@ async function isLockOwnerAlive(observed, deadlineAt, dependencies = {}) {
     return actualCreationTime === undefined || actualCreationTime === observed.processCreationTime;
 }
 function getCurrentProcessCreationTime() {
-    currentProcessCreationTime ??= getProcessCreationTime(process.pid);
+    // Windows process-table queries can be slow to start under CI. Keep the
+    // creation-time evidence when it is available, but bound this optional
+    // lookup so ordinary lock acquisition never waits on WMI indefinitely. An
+    // absent value is handled conservatively as PID-only liveness.
+    currentProcessCreationTime ??= process.platform === "win32"
+        ? getWindowsProcessInfo(process.pid, 1_500).then((info) => info?.creationTime)
+        : getProcessCreationTime(process.pid);
     return currentProcessCreationTime;
 }
 async function releaseOwnedLock(lockPath, ownerPath, token) {
@@ -1193,6 +1200,21 @@ function isProcessAlive(pid) {
     }
 }
 async function getProcessInfo(pid) {
+    // Process-table queries through PowerShell/WMI are comparatively expensive
+    // on Windows. We already have complete, trustworthy argv information for
+    // this process, so avoid starting a PowerShell child for every queue
+    // admission and state refresh.
+    if (pid === process.pid) {
+        const args = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+        return {
+            pid,
+            args,
+            commandLine: args.map(formatCommandLineArgument).join(" "),
+            executablePath: process.execPath,
+            name: node_path_1.default.basename(process.execPath),
+            creationTime: await getCurrentProcessCreationTime()
+        };
+    }
     if (process.platform === "win32") {
         return getWindowsProcessInfo(pid);
     }
@@ -1478,14 +1500,14 @@ async function getLinuxPortOwnerProcessInfo(port) {
     }
     return undefined;
 }
-async function getWindowsProcessInfo(pid) {
+async function getWindowsProcessInfo(pid, timeoutMs = WINDOWS_PROCESS_INFO_TIMEOUT_MS) {
     try {
         const { stdout } = await execFileAsync("powershell.exe", [
             "-NoProfile",
             "-Command",
             `Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" | ConvertTo-Json -Compress`
-        ]);
-        const trimmed = stdout.trim();
+        ], { timeout: timeoutMs });
+        const trimmed = String(stdout).trim();
         if (!trimmed) {
             return undefined;
         }

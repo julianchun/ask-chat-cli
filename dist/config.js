@@ -15,9 +15,17 @@ exports.DEFAULT_TIMEOUT_MS = 600_000;
 /** @deprecated Unset ASK_REMOTE_DEBUGGING_PORT now requests an automatic port. */
 exports.DEFAULT_REMOTE_DEBUGGING_PORT = 9222;
 function joinConfiguredPath(root, child) {
-    return /^[a-zA-Z]:[\\/]/.test(root) || root.includes("\\")
-        ? node_path_1.default.win32.join(root, child)
-        : node_path_1.default.join(root, child);
+    // Respect the path syntax supplied through ASK_HOME even when a test (or a
+    // cross-platform caller) evaluates it on a different host OS. Node's
+    // default path module follows the host, which turns injected POSIX paths
+    // such as /tmp into \\tmp on Windows and breaks deterministic discovery.
+    if (/^[a-zA-Z]:[\\/]/.test(root) || root.includes("\\")) {
+        return node_path_1.default.win32.join(root, child);
+    }
+    if (root.startsWith("/")) {
+        return node_path_1.default.posix.join(root, child);
+    }
+    return node_path_1.default.join(root, child);
 }
 function getAskHome(env = process.env) {
     return env.ASK_HOME || node_path_1.default.join(node_os_1.default.homedir(), ".ask");

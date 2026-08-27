@@ -370,14 +370,33 @@ async function updateState(env, now, inspectProcess, update) {
     });
 }
 async function removeDeadEntries(state, currentTime, inspectProcess) {
-    const alive = [];
-    for (const entry of [...state.active, ...state.queued, ...state.guards]) {
+    const entries = [...state.active, ...state.queued, ...state.guards];
+    // Windows process inspection starts PowerShell/WMI for non-current PIDs.
+    // Inspect stale entries concurrently so one dead queued worker cannot make
+    // cleanup exceed the queue poll deadline while unrelated active workers are
+    // checked serially.
+    const inspected = await Promise.all(entries.map(async (entry) => {
         if (currentTime - entry.processCheckedAt < PROCESS_RECHECK_MS) {
+            return { entry, processInfo: true };
+        }
+        return { entry, processInfo: await inspectProcess(entry.pid) };
+    }));
+    const alive = [];
+    for (const { entry, processInfo } of inspected) {
+        if (processInfo === true) {
             alive.push(entry);
             continue;
         }
-        const processInfo = await inspectProcess(entry.pid);
         if (!processInfo) {
+            // A process-table query can fail transiently (notably while Windows
+            // PowerShell/WMI is starting). Do not treat missing metadata as proof
+            // that a worker is dead: retaining a live entry is fail-closed for
+            // admission and avoids dispatching a duplicate execution. A later
+            // refresh can still remove it once the PID is no longer alive.
+            if ((0, session_1.isProcessAlive)(entry.pid)) {
+                entry.processCheckedAt = currentTime;
+                alive.push(entry);
+            }
             continue;
         }
         if (entry.processCreationTime &&

@@ -6,9 +6,17 @@ export const DEFAULT_TIMEOUT_MS = 600_000;
 export const DEFAULT_REMOTE_DEBUGGING_PORT = 9222;
 
 export function joinConfiguredPath(root: string, child: string): string {
-  return /^[a-zA-Z]:[\\/]/.test(root) || root.includes("\\")
-    ? path.win32.join(root, child)
-    : path.join(root, child);
+  // Respect the path syntax supplied through ASK_HOME even when a test (or a
+  // cross-platform caller) evaluates it on a different host OS. Node's
+  // default path module follows the host, which turns injected POSIX paths
+  // such as /tmp into \\tmp on Windows and breaks deterministic discovery.
+  if (/^[a-zA-Z]:[\\/]/.test(root) || root.includes("\\")) {
+    return path.win32.join(root, child);
+  }
+  if (root.startsWith("/")) {
+    return path.posix.join(root, child);
+  }
+  return path.join(root, child);
 }
 
 export function getAskHome(env: NodeJS.ProcessEnv = process.env): string {

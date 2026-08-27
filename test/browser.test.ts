@@ -94,6 +94,21 @@ describe("browser Chrome path detection", () => {
     expect(resolveChromePath(env, (filePath) => filePath === localChrome, "win32")).toBe(localChrome);
   });
 
+  it("uses the injected platform for executable validation", async () => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ask-chrome-platform-"));
+    const candidate = path.join(directory, "chrome-not-executable");
+    try {
+      await fs.promises.writeFile(candidate, "fixture", { mode: 0o755 });
+      expect(() => resolveChromePath(
+        { ASK_CHROME_PATH: candidate } as NodeJS.ProcessEnv,
+        fs.existsSync,
+        "win32"
+      )).toThrow("ASK_CHROME_PATH");
+    } finally {
+      await fs.promises.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("discovers only branded Google Chrome locations on macOS and Linux", () => {
     expect(getChromeCandidates({ HOME: "/Users/me" } as NodeJS.ProcessEnv, "darwin")).toEqual([
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -607,16 +622,24 @@ describe("browser remote debugging validation", () => {
 
   it("stops a launched process and leaves no session state when the lifecycle deadline expires", async () => {
     const askHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ask-browser-launch-timeout-"));
-    const fakeChromePath = path.join(askHome, "fake-chrome");
+    // A POSIX shebang script cannot be spawned by Windows directly. The
+    // native Node executable still gives this test a real child process there;
+    // it exits on the Chrome-only flags, so the endpoint wait exercises the
+    // same timeout and cleanup path without relying on Unix execute bits.
+    const fakeChromePath = process.platform === "win32"
+      ? process.execPath
+      : path.join(askHome, "fake-chrome");
     const pidPath = path.join(askHome, "spawned.pid");
-    await fs.promises.writeFile(
-      fakeChromePath,
-      `#!${process.execPath}\n` +
-      `const fs = require("node:fs");\n` +
-      `fs.writeFileSync(process.argv[process.argv.length - 1], String(process.pid));\n` +
-      `setInterval(() => undefined, 1000);\n`,
-      { mode: 0o755 }
-    );
+    if (process.platform !== "win32") {
+      await fs.promises.writeFile(
+        fakeChromePath,
+        `#!${process.execPath}\n` +
+        `const fs = require("node:fs");\n` +
+        `fs.writeFileSync(process.argv[process.argv.length - 1], String(process.pid));\n` +
+        `setInterval(() => undefined, 1000);\n`,
+        { mode: 0o755 }
+      );
+    }
     vi.stubGlobal("fetch", vi.fn(async () => {
       throw new Error("debugging endpoint is not ready");
     }));
@@ -760,6 +783,27 @@ describe("browser remote debugging validation", () => {
         classification: { ownership: "absent" }
       });
       expect(inspection.port).toBeUndefined();
+    } finally {
+      await fs.promises.rm(askHome, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a stale automatic endpoint before a session port is persisted", async () => {
+    const askHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ask-browser-stale-unassigned-"));
+    const env = { ASK_HOME: askHome } as NodeJS.ProcessEnv;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("stale endpoint");
+    }));
+    try {
+      await fs.promises.mkdir(path.dirname(getDevToolsActivePortPath(env)), { recursive: true });
+      await fs.promises.writeFile(getDevToolsActivePortPath(env), "54321\n/devtools/browser/stale\n", "utf8");
+
+      await expect(inspectChromeSession({ env })).resolves.toMatchObject({
+        portPolicy: "automatic",
+        connected: false,
+        classification: { ownership: "absent" }
+      });
+      await expect(inspectChromeSession({ env })).resolves.not.toHaveProperty("port");
     } finally {
       await fs.promises.rm(askHome, { recursive: true, force: true });
     }
