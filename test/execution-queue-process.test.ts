@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createExecutionQueue } from "../src/execution-queue";
 
 interface Worker {
   child: WorkerChild;
@@ -32,31 +33,51 @@ describe("execution queue across processes", () => {
       child.kill("SIGKILL");
     })));
     children.length = 0;
-    await fs.promises.rm(askHome, { recursive: true, force: true });
+    await fs.promises.rm(askHome, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25
+    });
   });
 
   it("admits four workers, queues four, and rejects a ninth", async () => {
-    const workers = Array.from({ length: 8 }, () => startWorker(askHome, 800));
+    const releasePath = path.join(askHome, "release-workers");
+    const workers = Array.from(
+      { length: 8 },
+      () => startWorker(askHome, 30_000, undefined, releasePath)
+    );
     children.push(...workers.map((worker) => worker.child));
 
-    await vi.waitFor(async () => {
-      await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 4 });
-    }, { timeout: 5_000, interval: 25 });
+    await vi.waitFor(() => {
+      const acquired = workers.filter((worker) =>
+        worker.output().includes('"event":"acquired"')
+      );
+      const queued = workers.filter((worker) =>
+        worker.output().includes('"event":"queued"')
+      );
+      expect(acquired).toHaveLength(4);
+      expect(queued).toHaveLength(4);
+    }, { timeout: 10_000, interval: 25 });
+    await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 4 });
 
     const overflow = startWorker(askHome, 10);
     children.push(overflow.child);
     await expect(overflow.completed).resolves.toBe(1);
     expect(overflow.error()).toContain("execution queue is full (4 active, 4 waiting)");
 
-    await expect(Promise.all(workers.map((worker) => worker.completed))).resolves.toEqual(
-      Array.from({ length: 8 }, () => 0)
-    );
+    await fs.promises.writeFile(releasePath, "release\n", "utf8");
+    const exitCodes = await Promise.all(workers.map((worker) => worker.completed));
+    expect(
+      exitCodes,
+      workers.map((worker, index) => `worker ${index + 1}: ${worker.error().trim() || "no stderr"}`).join("\n")
+    ).toEqual(Array.from({ length: 8 }, () => 0));
     for (const worker of workers) {
       expect(worker.output()).toContain('"event":"acquired"');
       expect(worker.output()).toContain('"event":"released"');
     }
     await expect(readCounts(askHome)).resolves.toEqual({ active: 0, queued: 0 });
-  }, 10_000);
+  }, 20_000);
 
   it("reclaims a slot after an active worker crashes", async () => {
     const active = Array.from({ length: 4 }, () => startWorker(askHome, 10_000));
@@ -79,7 +100,11 @@ describe("execution queue across processes", () => {
   }, 10_000);
 
   it("removes a queued worker when it is interrupted", async () => {
-    const active = Array.from({ length: 4 }, () => startWorker(askHome, 10_000));
+    const releasePath = path.join(askHome, "hold-active-workers");
+    const active = Array.from(
+      { length: 4 },
+      () => startWorker(askHome, 30_000, undefined, releasePath)
+    );
     children.push(...active.map((worker) => worker.child));
     await vi.waitFor(async () => {
       await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 0 });
@@ -87,14 +112,19 @@ describe("execution queue across processes", () => {
 
     const waiting = startWorker(askHome, 10_000);
     children.push(waiting.child);
-    await vi.waitFor(async () => {
-      await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 1 });
-    }, { timeout: 5_000, interval: 25 });
+    await vi.waitFor(() => {
+      expect(waiting.output()).toContain('"event":"queued"');
+    }, { timeout: 10_000, interval: 25 });
+    await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 1 });
 
     waiting.child.kill("SIGTERM");
     await waiting.completed;
+    const observer = createExecutionQueue(
+      { ASK_HOME: askHome } as NodeJS.ProcessEnv,
+      { handleSignals: false }
+    );
     await vi.waitFor(async () => {
-      await expect(readCounts(askHome)).resolves.toEqual({ active: 4, queued: 0 });
+      await expect(observer.inspect()).resolves.toEqual({ active: 4, queued: 0 });
     }, { timeout: 5_000, interval: 25 });
   }, 10_000);
 
@@ -132,20 +162,51 @@ describe("execution queue across processes", () => {
     await expect(guard.completed).resolves.toBe(0);
     await expect(matching.completed).resolves.toBe(0);
   }, 10_000);
+
+  it("elects one provider-readiness leader across processes", async () => {
+    const first = startGuardWorker(askHome, "provider-readiness", 600, "chatgpt");
+    children.push(first.child);
+    await vi.waitFor(() => {
+      expect(first.output()).toContain('"event":"guard-acquired"');
+    }, { timeout: 5_000, interval: 25 });
+
+    const second = startGuardWorker(askHome, "provider-readiness", 10, "chatgpt");
+    const otherProvider = startGuardWorker(askHome, "provider-readiness", 10, "gemini");
+    children.push(second.child, otherProvider.child);
+
+    await vi.waitFor(() => {
+      expect(otherProvider.output()).toContain('"event":"guard-acquired"');
+      expect(second.output()).not.toContain('"event":"guard-acquired"');
+    }, { timeout: 5_000, interval: 25 });
+
+    await expect(otherProvider.completed).resolves.toBe(0);
+    await expect(first.completed).resolves.toBe(0);
+    await expect(second.completed).resolves.toBe(0);
+    expect(second.output()).toContain('"event":"guard-acquired"');
+  }, 10_000);
 });
 
-function startWorker(askHome: string, holdMs: number, conversationName?: string): Worker {
+function startWorker(
+  askHome: string,
+  holdMs: number,
+  conversationName?: string,
+  releasePath?: string
+): Worker {
   const fixture = path.join(__dirname, "fixtures", "execution-worker.cjs");
   const args = [fixture, "chatgpt", String(holdMs)];
   if (conversationName) {
     args.push(conversationName);
   }
-  return startChild(askHome, args);
+  return startChild(
+    askHome,
+    args,
+    releasePath ? { ASK_TEST_RELEASE_FILE: releasePath } : undefined
+  );
 }
 
 function startGuardWorker(
   askHome: string,
-  kind: "browser" | "conversation",
+  kind: "browser" | "conversation" | "provider-readiness",
   holdMs: number,
   provider = "chatgpt",
   conversationName = "release"
@@ -154,9 +215,13 @@ function startGuardWorker(
   return startChild(askHome, [fixture, kind, String(holdMs), provider, conversationName]);
 }
 
-function startChild(askHome: string, args: string[]): Worker {
+function startChild(
+  askHome: string,
+  args: string[],
+  extraEnv: NodeJS.ProcessEnv = {}
+): Worker {
   const child = spawn(process.execPath, args, {
-    env: { ...process.env, ASK_HOME: askHome },
+    env: { ...process.env, ASK_HOME: askHome, ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"]
   });
   let stdout = "";

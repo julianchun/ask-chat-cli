@@ -18,7 +18,12 @@ describe("execution queue", () => {
   });
 
   afterEach(async () => {
-    await fs.promises.rm(askHome, { recursive: true, force: true });
+    await fs.promises.rm(askHome, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25
+    });
   });
 
   function makeQueue(options: Parameters<typeof createExecutionQueue>[1] = {}) {
@@ -143,6 +148,39 @@ describe("execution queue", () => {
     await promoted.release();
   });
 
+  it("can wait for active executions before an exclusive browser transition", async () => {
+    const queue = makeQueue({ waitTimeoutMs: 500 });
+    const active = await queue.acquire({ provider: "chatgpt" });
+    let acquired = false;
+    const maintenancePromise = queue.acquireBrowserLease({
+      headless: false,
+      exclusive: true,
+      waitForIdle: true,
+      timeoutMs: 500,
+      action: "log in"
+    }).then((lease) => {
+      acquired = true;
+      return lease;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(acquired).toBe(false);
+
+    const waiting = queue.acquire({ provider: "gemini" });
+    await vi.waitFor(async () => {
+      await expect(queue.inspect()).resolves.toEqual({ active: 1, queued: 1 });
+    });
+
+    await active.release();
+    const maintenance = await maintenancePromise;
+    expect(acquired).toBe(true);
+    await expect(queue.inspect()).resolves.toEqual({ active: 0, queued: 1 });
+
+    await maintenance.release();
+    const promoted = await waiting;
+    await promoted.release();
+  });
+
   it("allows same-mode browser reads and blocks incompatible mode transitions atomically", async () => {
     const queue = makeQueue();
     const visible = await queue.acquire({ provider: "chatgpt" });
@@ -165,6 +203,56 @@ describe("execution queue", () => {
     await read.release();
     const promoted = await headlessExecution;
     await promoted.release();
+  });
+
+  it("serializes provider readiness leadership without blocking another provider", async () => {
+    const queue = makeQueue({ waitTimeoutMs: 500 });
+    const leader = await queue.acquireProviderReadinessLease("chatgpt");
+    let followerAcquired = false;
+    const follower = queue.acquireProviderReadinessLease("chatgpt").then((lease) => {
+      followerAcquired = true;
+      return lease;
+    });
+
+    const gemini = await queue.acquireProviderReadinessLease("gemini");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(followerAcquired).toBe(false);
+
+    await leader.release();
+    const nextLeader = await follower;
+    expect(followerAcquired).toBe(true);
+    await Promise.all([nextLeader.release(), gemini.release()]);
+  });
+
+  it("reclaims a provider readiness guard owned by a dead process", async () => {
+    await fs.promises.writeFile(
+      getExecutionStatePath(env),
+      JSON.stringify({
+        version: 1,
+        active: [],
+        queued: [],
+        guards: [{
+          id: "dead-readiness",
+          pid: 99991,
+          processCreationTime: "dead-process",
+          processCheckedAt: 0,
+          createdAt: 0,
+          kind: "provider-readiness",
+          provider: "chatgpt"
+        }]
+      }),
+      "utf8"
+    );
+    const queue = createExecutionQueue(env, {
+      pollMs: 5,
+      handleSignals: false,
+      getProcessInfo: async (pid) => pid === process.pid
+        ? { pid, creationTime: "test-process" }
+        : undefined
+    });
+
+    const lease = await queue.acquireProviderReadinessLease("chatgpt");
+    await lease.release();
   });
 
   it("holds a conversation lease across forget so matching admission cannot race deletion", async () => {
@@ -201,6 +289,23 @@ describe("execution queue", () => {
     });
 
     await expect(queue.inspect()).resolves.toEqual({ active: 0, queued: 0 });
+  });
+
+  it("retains a live entry when process metadata is temporarily unavailable", async () => {
+    await fs.promises.writeFile(
+      getExecutionStatePath(env),
+      JSON.stringify({
+        version: 1,
+        active: [entry("live-but-uninspectable", process.pid)],
+        queued: []
+      }),
+      "utf8"
+    );
+    const queue = createExecutionQueue(env, {
+      getProcessInfo: async (pid) => ({ pid })
+    });
+
+    await expect(queue.inspect()).resolves.toEqual({ active: 1, queued: 0 });
   });
 
   it("releases a lease idempotently", async () => {

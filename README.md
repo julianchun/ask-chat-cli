@@ -35,44 +35,46 @@ npm link
 
 ## First run
 
-Windows detects common Chrome installation paths automatically. On macOS or Linux, set the Chrome executable first:
-
-```sh
-# macOS
-export ASK_CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-
-# Linux—adjust for your distribution
-export ASK_CHROME_PATH="/usr/bin/google-chrome"
-```
-
-Run `ask login` to open Chrome with a dedicated `ask` profile:
+`ask` detects common Google Chrome installations on Windows, macOS, and Linux. Set up the dedicated Ask profile once:
 
 ```console
-ask login
+ask setup
 ```
 
-Sign in to ChatGPT in the browser window. The dedicated Chrome profile preserves that login and is reused by later commands, so you normally only need to sign in once.
+Ask opens an ordinary Chrome window with browser automation disabled. Sign in to ChatGPT, then **fully quit that Ask Chrome instance**. Ask reopens the same dedicated profile as a managed headed Chrome session, verifies that the message box is ready, and minimizes its window. Daily prompts remain fully actionable without foregrounding Chrome, while avoiding the verification pages used by some headless browsers. Your personal Chrome profile is never copied, attached, or modified, and no extension is required.
 
-After signing in:
+Then run a normal prompt:
 
 ```console
 ask "Explain why the sky is blue"
 ```
 
+If you skip `ask setup`, the first interactive send detects the missing login, opens the same ordinary-Chrome setup flow, and resumes the original prompt after verification. Concurrent first-use sends for the same provider coordinate that setup, so only one ordinary Chrome sign-in window opens; waiting commands recheck readiness and resume their own prompt. Headless and non-interactive commands remain fail-fast because they cannot safely ask for credentials.
+
+`ask login` remains as an alias for `ask setup`. Automatic discovery intentionally finds branded Google Chrome only. Set `ASK_CHROME_PATH` when Chrome is installed somewhere unusual or when you intentionally use another Chromium-based executable.
+
 For Gemini, open its login page and sign in the same way:
 
 ```console
-ask --provider gemini login
+ask setup --provider gemini
 ask --provider gemini "Explain why the sky is blue"
 ```
+
+Gemini text-only sends use the same exactly-once coordinator as ChatGPT: Ask
+selects one verified click action and never falls back to Enter or retries after
+an uncertain click. Gemini attachments are intentionally unavailable for these
+sends for now. `--provider gemini --attach ...` fails before dispatch because
+Ask cannot yet prove that Gemini has finished processing every file; use Gemini
+manually for attachment workflows.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `ask [prompt...]` | Send a prompt and wait for the response; reads stdin when omitted |
-| `ask login` | Open the dedicated Chrome profile for sign-in |
-| `ask open [url\|prompt...]` | Open a conversation or fill a prompt in the visible browser |
+| `ask [prompt...]` | Send a prompt in a minimized headed Chrome session and wait for the response; reads stdin when omitted |
+| `ask setup` | Sign in once with ordinary Chrome, then verify the dedicated profile in the background |
+| `ask login` | Alias for `ask setup` |
+| `ask open [url\|prompt...]` | Open a conversation or fill a prompt in the visible browser; `--send` runs it in the background |
 | `ask get` | Print the latest response from the current provider page |
 | `ask dump` | Print or save the current provider page HTML |
 | `ask screenshot` | Save a screenshot of the current provider page |
@@ -90,9 +92,9 @@ ask --provider gemini "Explain why the sky is blue"
 | `--new` | Prompt, `open` | Start a new conversation; this is the default |
 | `--continue` | Prompt, `open` | Continue the previous conversation |
 | `--conversation <name>` | Prompt, `open` | Resume a named conversation, or create it if missing |
-| `--send` | `open` | Submit the filled prompt and wait for completion |
-| `--headless` | Prompt, `get`, `dump`, `screenshot` | Run the managed Chrome session headlessly |
-| `--timeout <ms>` | All commands | Set the operation timeout |
+| `--send` | `open` | Submit the prompt from a minimized headed Chrome session and wait for completion |
+| `--headless` | Prompt, `get`, `dump`, `screenshot` | Require headless Chrome; some providers may show bot verification instead |
+| `--timeout <ms>` | All commands | Set one deadline for browser readiness, authentication, submission, and response |
 | `-v, --verbose` | All commands | Print browser and session details |
 | `-V, --version` | Top level | Print the CLI version |
 | `-h, --help` | All commands | Show command help |
@@ -101,18 +103,18 @@ Run `ask --help` or `ask <command> --help` for the generated reference.
 
 ### Provider status
 
-`ask status` inspects the existing ask-managed Chrome session without launching Chrome or opening provider pages. It shows every configured provider by default:
+`ask status` inspects the existing ask-managed Chrome session without launching, recovering, restoring, or moving Chrome. It shows every configured provider by default:
 
 ```console
 $ ask status
-Chrome: running · ask-managed · visible · port 9222
+Chrome: running · ask-managed · background · port 51437
 
 PROVIDER  STATUS    AUTH              MESSAGE BOX
 ChatGPT   ready     signed-in-likely  available
 Gemini    not open  unknown           not checked
 ```
 
-Use `ask status --provider gemini` to filter the report. `ASK_PROVIDER` does not filter status output. Here, **message box** means the provider's text editor where `ask` enters a prompt. Use `ask status --verbose` to include page URLs, readiness flags, and notes.
+Use `ask status --provider gemini` to filter the report. `ASK_PROVIDER` does not filter status output. Here, **message box** means the provider's text editor where `ask` enters a prompt. The Chrome placement is observed read-only and is reported as `headless`, `background`, `visible`, or `unknown`; `unknown` means CDP could not fully inspect every headed window. Use `ask status --verbose` to include page URLs, readiness flags, notes, and the placement detail.
 
 ## Named conversations
 
@@ -156,7 +158,7 @@ wait
 
 `ask` allows four active prompt executions and four waiting executions. A ninth request fails immediately. Waiting requests use a global FIFO queue and time out after five minutes; this queue wait is separate from `--timeout`, which starts after execution begins.
 
-Each execution uses a fresh temporary tab and closes it afterward. Requests using the same provider and conversation name run sequentially. `--continue` waits for all active work for that provider so the meaning of “previous conversation” remains deterministic. Login and Chrome visibility-mode changes are rejected while prompt executions are active.
+Each execution uses a fresh temporary tab and closes it afterward. Headed send paths start and remain minimized, including after a response timeout. The sole exception is `PROMPT_DELIVERY_UNKNOWN`: that tab remains open and minimized so you can determine whether the provider accepted the prompt without risking a duplicate send. Requests using the same provider and conversation name run sequentially. `--continue` waits for all active work for that provider so the meaning of “previous conversation” remains deterministic. Setup/login and Chrome visibility-mode changes are rejected while prompt executions are active.
 
 ## Output
 
@@ -182,24 +184,31 @@ git diff | ask "Review this diff" -o review.md
 | Environment variable | Purpose |
 | --- | --- |
 | `ASK_PROVIDER` | Default provider: `chatgpt` or `gemini` |
-| `ASK_CHROME_PATH` | Path to the Chrome executable |
+| `ASK_CHROME_PATH` | Strict path to Chrome; also required for intentionally using an alternate Chromium browser |
 | `ASK_HOME` | State and browser-profile directory; defaults to `~/.ask` |
-| `ASK_REMOTE_DEBUGGING_PORT` | Chrome debugging port; defaults to `9222` |
+| `ASK_REMOTE_DEBUGGING_PORT` | Pin the Chrome debugging port; when unset, Chrome selects and ask persists a safe port |
 
 Command-line options override environment defaults.
 
+Without `ASK_REMOTE_DEBUGGING_PORT`, `ask status` shows `port auto` before the first managed session exists and the persisted assigned port afterward. A pinned port never falls back to another endpoint.
+
 ## Sessions and privacy
 
-`ask` keeps login state in its own Chrome profile under `~/.ask/chrome-profile` on macOS/Linux or `%USERPROFILE%\.ask\chrome-profile` on Windows. Named conversation URLs are stored in `~/.ask/conversations.json` or its Windows equivalent. It never copies or reuses your normal Chrome profile.
+`ask` keeps login state in its own Chrome profile under `~/.ask/chrome-profile` on macOS/Linux or `%USERPROFILE%\.ask\chrome-profile` on Windows. During setup, that profile is opened in ordinary Chrome without a remote-debugging endpoint; only after Chrome fully exits does Ask reopen it as a managed headed session and minimize it. Named conversation URLs are stored in `~/.ask/conversations.json` or its Windows equivalent. It never copies or reuses your normal Chrome profile.
 
 Prompts and attachments are sent to the selected provider. Treat the ask home directory as sensitive and do not commit it.
+
+When a send reaches `PROMPT_DELIVERY_UNKNOWN`, Ask leaves that worker tab open and records only the provider, CDP target id, known conversation URL (if any), managed-session generation, and timestamp under `ASK_HOME`. It never records the prompt, page HTML, cookies, account data, or DOM content there. Inspect the preserved tab, then close that tab yourself once delivery is resolved. Until the tab is gone, Ask refuses Chrome setup or mode/background restarts that would close the managed browser; retrying the requested operation after closing the tab safely clears the stale record.
 
 ## Troubleshooting
 
 - Run `ask status` for a quick readiness check or `ask status --verbose` for details.
-- Run `ask login` again if the provider is signed out.
-- If port `9222` is already in use, set a different `ASK_HOME` and `ASK_REMOTE_DEBUGGING_PORT`.
-- Provider execution failures identify the failed stage and a stable code, then print a suggested next action. A response timeout still returns any partial response on stdout and exits with code `2`.
+- Run `ask setup` (or `ask login`) to complete sign-in before sending a prompt. If an interactive send (`ask ...` or `ask open --send ...`) discovers a missing login before submission, it starts setup in ordinary Chrome and retries once within the same command deadline.
+- Fully quit the ordinary Ask Chrome window after signing in; closing only its active tab is not enough. Ask cannot safely reuse the profile while Chrome still owns it.
+- Headless and non-interactive commands cannot complete sign-in; run `ask setup` once from an interactive terminal first.
+- When `ASK_REMOTE_DEBUGGING_PORT` is unset, ask avoids external port conflicts automatically. An explicitly pinned port remains strict and fails rather than taking over another process.
+- Provider execution failures identify the failed stage and a stable code, then print a suggested next action. A response timeout still returns any partial response on stdout and exits with code `2`; confirmed delivery is unsafe to resend, so reopen or continue the saved conversation.
+- `PROMPT_DELIVERY_UNKNOWN` means ask performed at most one send action but could not prove acceptance. The worker tab is left open for inspection; do not rerun the prompt until you confirm whether it was delivered. After inspection, close that worker tab yourself, then retry any setup or mode-changing command that was blocked to let Ask reclaim its safety record.
 
 ## Development
 
@@ -207,7 +216,8 @@ Prompts and attachments are sent to the selected provider. Treat the ask home di
 npm test
 npm run typecheck
 npm run build
-npm run test:browser
 ```
 
-`npm run test:browser` requires `ASK_CHROME_PATH` and runs isolated pages in a real Chrome process over one debugging port. `npm run test:e2e:features` uses the same opt-in Chrome path to verify all-provider status and structured failure cleanup against locally intercepted provider fixtures. The opt-in `ASK_LIVE_TEST=1 npm run test:live:parallel` command sends six real ChatGPT prompts, creates provider conversations, and consumes account usage; it is intentionally excluded from the normal test suite.
+`npm test` runs the portable unit suite. It intentionally excludes all real-Chrome and account-backed suites, so it does not need a local Chrome installation, a signed-in profile, or an open debugging port. The GitHub Actions matrix runs `npm ci`, type-checking, a build, and this portable suite on Linux, macOS, and Windows. Its Chrome discovery, path-comparison, and port-policy cases use injected environment/platform/process seams rather than the host operating system.
+
+`ASK_CHROME_PATH=/path/to/chrome npm run test:browser` is an explicit real-Chrome opt-in: it verifies automatic endpoint reuse, multiprocess startup, cross-profile ownership, and isolated pages. `ASK_CHROME_PATH=/path/to/chrome npm run test:e2e:features` uses the same opt-in browser process to verify all-provider status, exactly-once ChatGPT and Gemini DOM dispatch, and structured failure cleanup against locally intercepted provider fixtures. With an already-running, signed-in Ask Chrome page, `ASK_LIVE_CAPABILITY_TEST=1 npm run test:live:capabilities` performs a non-sending ChatGPT capability smoke test. The separate opt-in `ASK_LIVE_TEST=1 npm run test:live:parallel` command sends six real prompts, creates provider conversations, and consumes account usage; both live tests remain outside normal CI.

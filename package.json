@@ -1,17 +1,23 @@
 {
   "name": "ask-chat-cli",
   "version": "0.1.0",
-  "description": "Personal Windows-first ask CLI for driving ChatGPT or Gemini in a dedicated Chrome profile.",
+  "description": "Personal ask CLI for driving ChatGPT or Gemini in a dedicated Chrome profile.",
   "private": true,
   "type": "commonjs",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "ask": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "npm run build && vitest run",
-    "test:browser": "npm run build && vitest run test/real-browser-parallel.test.ts",
+    "prepack": "npm run build",
+    "test": "npm run build && npm run test:unit",
+    "test:unit": "vitest run --exclude test/browser-auto-live.test.ts --exclude test/real-browser-parallel.test.ts --exclude test/real-feature-e2e.test.ts --exclude test/live-chatgpt-capability.test.ts --exclude test/live-chatgpt-parallel.test.ts",
+    "test:browser": "npm run build && vitest run test/browser-auto-live.test.ts test/real-browser-parallel.test.ts",
     "test:e2e:features": "npm run build && vitest run test/real-feature-e2e.test.ts",
+    "test:live:capabilities": "npm run build && vitest run test/live-chatgpt-capability.test.ts",
     "test:live:parallel": "npm run build && vitest run test/live-chatgpt-parallel.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

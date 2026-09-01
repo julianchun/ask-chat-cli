@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getAskHome } from "./config";
 import type { ProviderName } from "./providers";
-import { getProcessInfo, type ProcessInfo } from "./session";
+import { getProcessInfo, isProcessAlive, type ProcessInfo } from "./session";
 
 export const MAX_ACTIVE_EXECUTIONS = 4;
 export const MAX_QUEUED_EXECUTIONS = 4;
@@ -14,6 +14,7 @@ const DEFAULT_POLL_MS = 250;
 const PROCESS_RECHECK_MS = 2_000;
 const STATE_LOCK_TIMEOUT_MS = 2_000;
 const STALE_STATE_LOCK_MS = 30_000;
+const STATE_LOCK_RELEASE_TIMEOUT_MS = 500;
 
 interface ExecutionEntry {
   id: string;
@@ -41,7 +42,7 @@ interface ExecutionGuard {
   processCreationTime?: string;
   processCheckedAt: number;
   createdAt: number;
-  kind: "browser" | "conversation";
+  kind: "browser" | "conversation" | "provider-readiness";
   headless?: boolean;
   exclusive?: boolean;
   provider?: ProviderName;
@@ -72,6 +73,10 @@ export interface ExecutionLease {
 export interface BrowserLeaseRequest {
   headless: boolean;
   exclusive?: boolean;
+  /** Wait for active executions and browser guards to drain before acquiring an exclusive lease. */
+  waitForIdle?: boolean;
+  /** Deadline used only while waiting for an idle exclusive lease. */
+  timeoutMs?: number;
   action: string;
 }
 
@@ -93,6 +98,7 @@ interface ExecutionQueueOptions {
 export interface ExecutionQueue {
   acquire(request: ExecutionRequest): Promise<ExecutionLease>;
   acquireBrowserLease(request: BrowserLeaseRequest): Promise<ExecutionLease>;
+  acquireProviderReadinessLease(provider: ProviderName, timeoutMs?: number): Promise<ExecutionLease>;
   acquireConversationLease(provider: ProviderName, conversationName: string): Promise<ExecutionLease>;
   inspect(): Promise<ExecutionQueueSnapshot>;
   assertNoActive(action: string): Promise<void>;
@@ -116,7 +122,7 @@ export function createExecutionQueue(
   const waitTimeoutMs = options.waitTimeoutMs ?? EXECUTION_QUEUE_WAIT_TIMEOUT_MS;
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
   const now = options.now ?? Date.now;
-  const inspectProcess = options.getProcessInfo ?? getProcessInfo;
+  const inspectProcess = options.getProcessInfo ?? getExecutionOwnerProcessInfo;
   const handleSignals = options.handleSignals ?? true;
 
   return {
@@ -232,6 +238,56 @@ export function createExecutionQueue(
         headless: request.headless,
         exclusive: Boolean(request.exclusive)
       });
+
+      if (request.exclusive && request.waitForIdle) {
+        const idleWaitTimeoutMs = Math.max(0, request.timeoutMs ?? waitTimeoutMs);
+        const deadline = now() + idleWaitTimeoutMs;
+        try {
+          while (true) {
+            const acquired = await updateState(env, now, inspectProcess, (state) => {
+              promoteEligible(state, maxActive, now());
+              const browserGuards = state.guards.filter((entry) => entry.kind === "browser");
+              const anotherExclusiveGuard = browserGuards.some(
+                (entry) => entry.exclusive && entry.id !== guard.id
+              );
+              if (anotherExclusiveGuard) {
+                return false;
+              }
+
+              if (!state.guards.some((entry) => entry.id === guard.id)) {
+                // Reserve the exclusive transition while existing operations
+                // drain. This prevents a new prompt from racing into the gap
+                // between the idle check and setup's browser connection.
+                state.guards.push(guard);
+              }
+
+              const otherBrowserGuards = state.guards.some(
+                (entry) => entry.kind === "browser" && entry.id !== guard.id
+              );
+              return state.active.length === 0 && !otherBrowserGuards;
+            });
+
+            if (acquired) {
+              return guardLease(env, guard.id, now, inspectProcess, maxActive);
+            }
+            if (now() >= deadline) {
+              throw new Error(
+                `ask: timed out after ${Math.ceil(idleWaitTimeoutMs / 1000)} seconds waiting to ${request.action} until the browser is idle`
+              );
+            }
+            await delay(Math.min(pollMs, Math.max(1, deadline - now())));
+          }
+        } catch (error) {
+          // The reservation may have been installed before the timeout or a
+          // state-write failure. Remove it so queued work can continue.
+          await updateState(env, now, inspectProcess, (state) => {
+            state.guards = state.guards.filter((entry) => entry.id !== guard.id);
+            promoteEligible(state, maxActive, now());
+          }).catch(() => undefined);
+          throw error;
+        }
+      }
+
       await updateState(env, now, inspectProcess, (state) => {
         promoteEligible(state, maxActive, now());
         const browserGuards = state.guards.filter((entry) => entry.kind === "browser");
@@ -254,6 +310,35 @@ export function createExecutionQueue(
         state.guards.push(guard);
       });
       return guardLease(env, guard.id, now, inspectProcess, maxActive);
+    },
+
+    acquireProviderReadinessLease: async (provider, readinessTimeoutMs = waitTimeoutMs) => {
+      const guard = await createGuard("provider-readiness", now, inspectProcess, { provider });
+      const deadline = now() + readinessTimeoutMs;
+
+      while (true) {
+        const acquired = await updateState(env, now, inspectProcess, (state) => {
+          promoteEligible(state, maxActive, now());
+          const existing = state.guards.some(
+            (entry) => entry.kind === "provider-readiness" && entry.provider === provider
+          );
+          if (existing) {
+            return false;
+          }
+          state.guards.push(guard);
+          return true;
+        });
+
+        if (acquired) {
+          return guardLease(env, guard.id, now, inspectProcess, maxActive);
+        }
+        if (now() >= deadline) {
+          throw new Error(
+            `ask: timed out after ${Math.ceil(readinessTimeoutMs / 1000)} seconds waiting for ${provider} readiness`
+          );
+        }
+        await delay(Math.min(pollMs, Math.max(1, deadline - now())));
+      }
     },
 
     acquireConversationLease: async (provider, conversationName) => {
@@ -309,6 +394,18 @@ export function createExecutionQueue(
       }
     }
   };
+}
+
+async function getExecutionOwnerProcessInfo(pid: number): Promise<ProcessInfo | undefined> {
+  if (process.platform === "win32") {
+    // Queue owners intentionally omit Windows creation-time metadata because
+    // obtaining it requires PowerShell/WMI. Refreshing several owners while
+    // holding the state lock would otherwise make concurrent releases exceed
+    // the lock deadline. PID liveness is the strongest comparable evidence in
+    // that state and remains fail-closed when inspection is denied.
+    return isProcessAlive(pid) ? { pid } : undefined;
+  }
+  return getProcessInfo(pid);
 }
 
 type LocatedEntry = ExecutionQueueUpdate | { phase: "missing" };
@@ -470,13 +567,23 @@ async function removeDeadEntries(
   currentTime: number,
   inspectProcess: (pid: number) => Promise<ProcessInfo | undefined>
 ): Promise<void> {
-  const alive: Array<ExecutionEntry | ExecutionGuard> = [];
-  for (const entry of [...state.active, ...state.queued, ...state.guards]) {
+  const entries = [...state.active, ...state.queued, ...state.guards];
+  // Inspect stale entries concurrently so one dead queued worker cannot make
+  // cleanup exceed the queue poll deadline while unrelated active workers are
+  // checked serially. getProcessInfo returns a minimal PID-only record when
+  // metadata inspection is unavailable, so undefined means the owner is gone.
+  const inspected = await Promise.all(entries.map(async (entry) => {
     if (currentTime - entry.processCheckedAt < PROCESS_RECHECK_MS) {
+      return { entry, processInfo: true as const };
+    }
+    return { entry, processInfo: await inspectProcess(entry.pid) };
+  }));
+  const alive: Array<ExecutionEntry | ExecutionGuard> = [];
+  for (const { entry, processInfo } of inspected) {
+    if (processInfo === true) {
       alive.push(entry);
       continue;
     }
-    const processInfo = await inspectProcess(entry.pid);
     if (!processInfo) {
       continue;
     }
@@ -532,26 +639,43 @@ async function withStateLock<T>(env: NodeJS.ProcessEnv, now: () => number, fn: (
   let handle: fs.promises.FileHandle | undefined;
 
   while (!handle) {
+    let candidateHandle: fs.promises.FileHandle;
     try {
-      handle = await fs.promises.open(lockPath, "wx");
-      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+      candidateHandle = await fs.promises.open(lockPath, "wx");
     } catch (error) {
-      if (!isFileExistsError(error)) {
+      if (!isStateLockContentionError(error)) {
         throw error;
       }
       try {
         const stat = await fs.promises.stat(lockPath);
         if (now() - stat.mtimeMs > STALE_STATE_LOCK_MS) {
-          await fs.promises.rm(lockPath, { force: true });
+          await removeStateLockFile(lockPath);
           continue;
         }
-      } catch {
+      } catch (inspectionError) {
+        if (!isMissingFileError(inspectionError) && !isStateLockContentionError(inspectionError)) {
+          throw inspectionError;
+        }
+        if (now() >= deadline) {
+          throw new Error("ask: timed out waiting to update execution queue state");
+        }
+        await delay(25);
         continue;
       }
       if (now() >= deadline) {
         throw new Error("ask: timed out waiting to update execution queue state");
       }
       await delay(25);
+      continue;
+    }
+
+    try {
+      await candidateHandle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+      handle = candidateHandle;
+    } catch (error) {
+      await candidateHandle.close().catch(() => undefined);
+      await removeStateLockFile(lockPath).catch(() => undefined);
+      throw error;
     }
   }
 
@@ -559,12 +683,44 @@ async function withStateLock<T>(env: NodeJS.ProcessEnv, now: () => number, fn: (
     return await fn();
   } finally {
     await handle.close().catch(() => undefined);
-    await fs.promises.rm(lockPath, { force: true }).catch(() => undefined);
+    await removeStateLockFile(lockPath);
   }
 }
 
 function isFileExistsError(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
+}
+
+function isStateLockContentionError(error: unknown): boolean {
+  if (isFileExistsError(error)) {
+    return true;
+  }
+  if (process.platform !== "win32" || !error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+  return error.code === "EPERM" || error.code === "EACCES" || error.code === "EBUSY";
+}
+
+async function removeStateLockFile(lockPath: string): Promise<void> {
+  const deadlineAt = Date.now() + STATE_LOCK_RELEASE_TIMEOUT_MS;
+  while (true) {
+    try {
+      await fs.promises.unlink(lockPath);
+      return;
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return;
+      }
+      if (!isStateLockContentionError(error) || Date.now() >= deadlineAt) {
+        throw error;
+      }
+      await delay(10);
+    }
+  }
 }
 
 function delay(ms: number): Promise<void> {

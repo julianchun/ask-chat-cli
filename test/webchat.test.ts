@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser, Page } from "playwright-core";
 import { providerRegistry } from "../src/providers";
 import {
@@ -112,6 +112,7 @@ class FakePage {
   evaluateText = "";
   evaluateResults: unknown[] = [];
   broughtToFront = false;
+  closed = false;
   titleText = "";
 
   constructor(private currentUrl = "about:blank") {}
@@ -126,6 +127,10 @@ class FakePage {
 
   async bringToFront(): Promise<void> {
     this.broughtToFront = true;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
   }
 
   async title(): Promise<string> {
@@ -171,14 +176,61 @@ class FakeContext {
     this.pageList.push(page);
     return page;
   }
+
+  addPage(page: FakePage): void {
+    this.pageList.push(page);
+  }
 }
 
 class FakeBrowser {
+  readonly cdpCommands: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  cdpDetachCount = 0;
+  private targetSequence = 0;
+
   constructor(private readonly context: FakeContext) {}
 
   contexts(): FakeContext[] {
     return [this.context];
   }
+
+  async newBrowserCDPSession(): Promise<{
+    send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>;
+    detach(): Promise<void>;
+  }> {
+    return {
+      send: async (method, params) => {
+        this.cdpCommands.push({ method, params });
+        if (method === "Target.createTarget") {
+          this.targetSequence += 1;
+          this.context.addPage(new FakePage(String(params?.url || "about:blank")));
+          return { targetId: `target-${this.targetSequence}` };
+        }
+        return { success: true };
+      },
+      detach: async () => {
+        this.cdpDetachCount += 1;
+      }
+    };
+  }
+}
+
+async function expectLifecycleTimeoutNearBudget(
+  run: () => Promise<unknown>,
+  timeoutMs: number
+): Promise<void> {
+  const startedAt = Date.now();
+  let failure: unknown;
+  try {
+    await run();
+  } catch (error) {
+    failure = error;
+  }
+
+  const elapsedMs = Date.now() - startedAt;
+  expect(failure).toBeInstanceOf(Error);
+  expect(String(failure)).toMatch(/deadline|timed? out|timeout/i);
+  expect(elapsedMs).toBeGreaterThanOrEqual(Math.max(1, timeoutMs - 20));
+  expect(elapsedMs).toBeLessThan(500);
 }
 
 describe("provider automation", () => {
@@ -248,6 +300,131 @@ describe("provider automation", () => {
     expect(page.url()).toBe("https://chatgpt.com/");
     expect((page as unknown as FakePage).broughtToFront).toBe(false);
     expect(context.createdPages).toBe(1);
+  });
+
+  it("creates and parks a background CDP target before provider navigation", async () => {
+    const existing = new FakePage("https://chatgpt.com/c/existing");
+    const context = new FakeContext([existing]);
+    const browser = new FakeBrowser(context);
+    const onPageCreated = vi.fn(async (page: Page) => {
+      expect(page.url()).toMatch(/^about:blank#ask-worker-/);
+    });
+
+    const page = await openWorkerPage(
+      browser as unknown as Browser,
+      providerRegistry.chatgpt,
+      "https://chatgpt.com/",
+      { background: true, onPageCreated, timeoutMs: 1_000 }
+    );
+
+    expect(browser.cdpCommands).toEqual([
+      {
+        method: "Target.createTarget",
+        params: {
+          url: expect.stringMatching(/^about:blank#ask-worker-/),
+          background: true
+        }
+      }
+    ]);
+    expect(onPageCreated).toHaveBeenCalledOnce();
+    expect(page.url()).toBe("https://chatgpt.com/");
+    expect((page as unknown as FakePage).broughtToFront).toBe(false);
+    expect(context.createdPages).toBe(0);
+    expect(browser.cdpDetachCount).toBe(1);
+  });
+
+  it("bounds a hung worker newPage call by the requested lifecycle timeout", async () => {
+    const context = new FakeContext([]);
+    context.newPage = async () => new Promise<FakePage>(() => {});
+    const browser = new FakeBrowser(context);
+
+    await expectLifecycleTimeoutNearBudget(
+      () => openWorkerPage(
+        browser as unknown as Browser,
+        providerRegistry.chatgpt,
+        "https://chatgpt.com/",
+        { timeoutMs: 35 }
+      ),
+      35
+    );
+  });
+
+  it("bounds a hung worker navigation by the requested lifecycle timeout", async () => {
+    const worker = new FakePage();
+    worker.goto = async () => new Promise<void>(() => {});
+    const context = new FakeContext([]);
+    context.newPage = async () => worker;
+    const browser = new FakeBrowser(context);
+
+    await expectLifecycleTimeoutNearBudget(
+      () => openWorkerPage(
+        browser as unknown as Browser,
+        providerRegistry.chatgpt,
+        "https://chatgpt.com/",
+        { timeoutMs: 35 }
+      ),
+      35
+    );
+  });
+
+  it("bounds a hung foreground operation by the requested lifecycle timeout", async () => {
+    const chatPage = new FakePage("https://chatgpt.com/");
+    chatPage.bringToFront = async () => new Promise<void>(() => {});
+    const context = new FakeContext([chatPage]);
+    const browser = new FakeBrowser(context);
+
+    await expectLifecycleTimeoutNearBudget(
+      () => openChatPage(
+        browser as unknown as Browser,
+        providerRegistry.chatgpt,
+        "https://chatgpt.com/",
+        { timeoutMs: 35 }
+      ),
+      35
+    );
+  });
+
+  it("shares one worker-page budget across page creation and navigation", async () => {
+    vi.useFakeTimers();
+    try {
+      const worker = new FakePage();
+      let navigationStarted = false;
+      worker.goto = async () => {
+        navigationStarted = true;
+        return new Promise<void>(() => {});
+      };
+      const context = new FakeContext([]);
+      context.newPage = async () => new Promise<FakePage>((resolve) => {
+        setTimeout(() => resolve(worker), 60);
+      });
+      const browser = new FakeBrowser(context);
+
+      let settled = false;
+      const outcome = openWorkerPage(
+        browser as unknown as Browser,
+        providerRegistry.chatgpt,
+        "https://chatgpt.com/",
+        { timeoutMs: 100 }
+      ).then(
+        () => ({ status: "fulfilled" as const, error: undefined }),
+        (error: unknown) => ({ status: "rejected" as const, error })
+      );
+      void outcome.then(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(99);
+      expect(navigationStarted).toBe(true);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await outcome;
+      expect(result.status).toBe("rejected");
+      expect(result.error).toBeInstanceOf(Error);
+      expect(String(result.error)).toMatch(/deadline|timed? out|timeout/i);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("isolates repeated executions in separate worker pages", async () => {
@@ -389,6 +566,22 @@ describe("provider automation", () => {
       authState: "signed-in-likely",
       readyToSend: true,
       readyForHeadless: true
+    });
+  });
+
+  it("keeps conflicting signed-in and signed-out evidence unknown", async () => {
+    const page = new FakePage("https://chatgpt.com/");
+    page.locators.set("#prompt-textarea", new FakeLocator());
+    page.locators.set('[data-testid="accounts-profile-button"]', new FakeLocator());
+    page.locators.set('a[href*="/auth/login"]', new FakeLocator());
+
+    const inspection = await providerRegistry.chatgpt.automation.inspectPage(page as unknown as Page, 100);
+
+    expect(inspection).toEqual({
+      promptInputVisible: true,
+      authState: "unknown",
+      readyToSend: true,
+      readyForHeadless: false
     });
   });
 
@@ -602,7 +795,7 @@ describe("provider automation", () => {
     expect(result).toEqual({ text: "final answer", timedOut: false });
   });
 
-  it("waits for Gemini Copy action and returns only inner response content", async () => {
+  it("does not require a Gemini Copy action when the caller requests immediate stability", async () => {
     const page = new FakePage();
     page.evaluateResults = [
       {
@@ -628,7 +821,7 @@ describe("provider automation", () => {
       baseline: { key: "response-container:0", text: "old answer", count: 1 }
     });
 
-    expect(result).toEqual({ text: "final answer without Gemini said label", timedOut: false });
+    expect(result).toEqual({ text: "partial answer", timedOut: false });
   });
 
   describe.each([

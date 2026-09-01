@@ -32,4 +32,19 @@ describe("providers", () => {
       });
     }
   });
+
+  it("enables the evidence-driven execution adapter for every send-capable provider", () => {
+    for (const [providerName, provider] of Object.entries(providerRegistry)) {
+      expect(provider.execution).toMatchObject({
+        provider: providerName,
+        matchesConversationUrl: expect.any(Function),
+        discoverCapabilities: expect.any(Function),
+        attachAndVerify: expect.any(Function),
+        fillAndVerifyDraft: expect.any(Function),
+        preselectDispatch: expect.any(Function),
+        observeSubmission: expect.any(Function),
+        waitForResponse: expect.any(Function)
+      });
+    }
+  });
 });

@@ -1,9 +1,11 @@
+const fs = require("node:fs");
 const { createExecutionQueue } = require("../../dist/execution-queue.js");
 
 const provider = process.argv[2] || "chatgpt";
 const holdMs = Number(process.argv[3] || 200);
 const conversationName = process.argv[4] || undefined;
 const exclusiveProvider = process.argv[5] === "exclusive";
+const releasePath = process.env.ASK_TEST_RELEASE_FILE;
 
 async function main() {
   const queue = createExecutionQueue(process.env);
@@ -16,7 +18,13 @@ async function main() {
     }
   });
   process.stdout.write(`${JSON.stringify({ event: "acquired", id: lease.id })}\n`);
-  await new Promise((resolve) => setTimeout(resolve, holdMs));
+  if (releasePath) {
+    while (!fs.existsSync(releasePath)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, holdMs));
+  }
   await lease.release();
   process.stdout.write(`${JSON.stringify({ event: "released", id: lease.id })}\n`);
 }

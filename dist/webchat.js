@@ -10,7 +10,9 @@ exports.openWorkerPage = openWorkerPage;
 exports.selectCurrentPage = selectCurrentPage;
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
+const node_crypto_1 = require("node:crypto");
 const errors_1 = require("./errors");
+const session_1 = require("./session");
 function createProviderAutomation(config) {
     return {
         inspectPage: (page, timeoutMs) => inspectProviderPage(page, config, timeoutMs),
@@ -31,23 +33,116 @@ function getDefaultContext(browser) {
     return existing;
 }
 async function openChatPage(browser, provider, url = provider.homeUrl, options = {}) {
+    const deadlineAt = (0, session_1.resolveDeadlineAt)(options);
+    const timeoutMessage = `Timed out opening the ${provider.displayName} chat page.`;
+    (0, session_1.throwIfDeadlineExceeded)(deadlineAt, timeoutMessage);
     const context = getDefaultContext(browser);
-    const page = options.newSession ? await context.newPage() : selectReusableChatPage(context, provider, url) || (await context.newPage());
-    await page.bringToFront();
-    const reusingProviderConversation = sameUrl(url, provider.homeUrl) && provider.matchesConversationUrl(page.url());
-    if (!sameUrl(page.url(), url) && !reusingProviderConversation) {
-        await page.goto(url, { waitUntil: "domcontentloaded" });
+    let page = options.newSession ? undefined : selectReusableChatPage(context, provider, url);
+    const created = page === undefined;
+    if (!page) {
+        page = await newPageWithinDeadline(context, deadlineAt, timeoutMessage);
     }
-    await page.bringToFront();
-    return page;
+    try {
+        await (0, session_1.raceWithDeadline)(page.bringToFront(), deadlineAt, timeoutMessage);
+        const reusingProviderConversation = sameUrl(url, provider.homeUrl) && provider.matchesConversationUrl(page.url());
+        if (!sameUrl(page.url(), url) && !reusingProviderConversation) {
+            await gotoWithinDeadline(page, url, deadlineAt, timeoutMessage);
+        }
+        await (0, session_1.raceWithDeadline)(page.bringToFront(), deadlineAt, timeoutMessage);
+        return page;
+    }
+    catch (error) {
+        if (created) {
+            void page.close().catch(() => undefined);
+        }
+        throw error;
+    }
 }
-async function openWorkerPage(browser, provider, url = provider.homeUrl) {
+async function openWorkerPage(browser, provider, url = provider.homeUrl, options = {}) {
+    const deadlineAt = (0, session_1.resolveDeadlineAt)(options);
+    const timeoutMessage = `Timed out opening the ${provider.displayName} worker page.`;
+    (0, session_1.throwIfDeadlineExceeded)(deadlineAt, timeoutMessage);
     const context = getDefaultContext(browser);
-    const page = await context.newPage();
-    if (!sameUrl(page.url(), url)) {
-        await page.goto(url, { waitUntil: "domcontentloaded" });
+    const page = options.background
+        ? await newBackgroundPageWithinDeadline(browser, context, deadlineAt, timeoutMessage)
+        : await newPageWithinDeadline(context, deadlineAt, timeoutMessage);
+    try {
+        if (options.onPageCreated) {
+            await (0, session_1.raceWithDeadline)(Promise.resolve().then(() => options.onPageCreated(page)), deadlineAt, timeoutMessage);
+        }
+        if (!sameUrl(page.url(), url)) {
+            await gotoWithinDeadline(page, url, deadlineAt, timeoutMessage);
+        }
+        return page;
     }
-    return page;
+    catch (error) {
+        void page.close().catch(() => undefined);
+        throw error;
+    }
+}
+async function newBackgroundPageWithinDeadline(browser, context, deadlineAt, timeoutMessage) {
+    (0, session_1.throwIfDeadlineExceeded)(deadlineAt, timeoutMessage);
+    const markerUrl = `about:blank#ask-worker-${(0, node_crypto_1.randomUUID)()}`;
+    const browserSession = await (0, session_1.raceWithDeadline)(browser.newBrowserCDPSession(), deadlineAt, timeoutMessage, (lateSession) => lateSession.detach().catch(() => undefined));
+    let targetId;
+    try {
+        const createTarget = browserSession.send("Target.createTarget", {
+            url: markerUrl,
+            background: true
+        });
+        const created = await (0, session_1.raceWithDeadline)(createTarget, deadlineAt, timeoutMessage, async (lateTarget) => {
+            if (typeof lateTarget.targetId === "string" && lateTarget.targetId) {
+                await closeBrowserTarget(browser, lateTarget.targetId);
+            }
+        });
+        if (typeof created.targetId !== "string" || !created.targetId) {
+            throw new Error("Chrome did not return a target id for the background worker page.");
+        }
+        targetId = created.targetId;
+        while (true) {
+            const page = context.pages().find((candidate) => candidate.url() === markerUrl);
+            if (page) {
+                return page;
+            }
+            (0, session_1.throwIfDeadlineExceeded)(deadlineAt, timeoutMessage);
+            await (0, session_1.delayWithinDeadline)(10, deadlineAt, timeoutMessage);
+        }
+    }
+    catch (error) {
+        if (targetId) {
+            void closeBrowserTarget(browser, targetId);
+        }
+        throw error;
+    }
+    finally {
+        await browserSession.detach().catch(() => undefined);
+    }
+}
+async function closeBrowserTarget(browser, targetId) {
+    let session;
+    try {
+        session = await browser.newBrowserCDPSession();
+        await session.send("Target.closeTarget", { targetId });
+    }
+    catch {
+        // A failed or timed-out worker creation is already returning its primary
+        // error. Best-effort target cleanup must not replace that result.
+    }
+    finally {
+        await session?.detach().catch(() => undefined);
+    }
+}
+async function newPageWithinDeadline(context, deadlineAt, timeoutMessage) {
+    (0, session_1.throwIfDeadlineExceeded)(deadlineAt, timeoutMessage);
+    return (0, session_1.raceWithDeadline)(context.newPage(), deadlineAt, timeoutMessage, (latePage) => latePage.close().catch(() => undefined));
+}
+async function gotoWithinDeadline(page, url, deadlineAt, timeoutMessage) {
+    (0, session_1.throwIfDeadlineExceeded)(deadlineAt, timeoutMessage);
+    const remainingMs = (0, session_1.remainingDeadlineMs)(deadlineAt);
+    await (0, session_1.raceWithDeadline)(page.goto(url, {
+        waitUntil: "domcontentloaded",
+        ...(remainingMs === undefined ? {} : { timeout: Math.max(1, remainingMs) })
+    }), deadlineAt, timeoutMessage);
 }
 function selectReusableChatPage(context, provider, url, preferredUrl) {
     const pages = context.pages();
@@ -170,21 +265,26 @@ async function hasAnyAttached(page, selectors) {
     return false;
 }
 async function inspectProviderPage(page, provider, timeoutMs = 3_000) {
-    const promptInputVisible = await hasPromptInput(page, provider, timeoutMs);
-    let pageTitle = "";
-    try {
-        pageTitle = await page.title();
-    }
-    catch {
-        // Some test and transitional pages do not expose a title yet.
-    }
-    const blocked = /just a moment/i.test(pageTitle) ||
-        await hasAnyVisible(page, provider.blockedSelectors, 1_000);
-    const signIn = await hasAnyVisible(page, provider.signInSelectors, 1_000);
-    const account = await hasAnyAttached(page, provider.accountSelectors);
+    const boundedTimeoutMs = Math.max(0, timeoutMs);
+    const deadlineAt = Date.now() + boundedTimeoutMs;
+    const reserveMs = Math.min(50, Math.max(1, Math.floor(boundedTimeoutMs / 10)));
+    const signalTimeoutMs = Math.max(1, boundedTimeoutMs - reserveMs);
+    const [promptInputVisible, pageTitle, blockedMarker, signIn, account] = await (0, session_1.raceWithDeadline)(Promise.all([
+        hasPromptInput(page, provider, signalTimeoutMs),
+        page.title().catch(() => ""),
+        hasAnyVisible(page, provider.blockedSelectors, signalTimeoutMs),
+        hasAnyVisible(page, provider.signInSelectors, signalTimeoutMs),
+        hasAnyAttached(page, provider.accountSelectors)
+    ]), deadlineAt, `Timed out inspecting ${provider.displayName} readiness.`);
+    const blocked = /just a moment/i.test(pageTitle) || blockedMarker;
     let authState = "unknown";
     if (blocked) {
         authState = "blocked";
+    }
+    else if (account && signIn) {
+        // Mixed signed-in and signed-out markers are common during SPA transitions.
+        // Treat the conflict as unknown instead of guessing from locale-dependent copy.
+        authState = "unknown";
     }
     else if (account && !signIn) {
         authState = "signed-in-likely";
